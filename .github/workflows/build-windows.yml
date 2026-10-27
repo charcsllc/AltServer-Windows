@@ -10,6 +10,8 @@ permissions:
 
 env:
   ALTSERVER_VERSION: 1.8.1
+  VCPKG_RELEASE: 2024.11.16
+  VCPKG_ROOT: C:\vcpkg-altserver
   VCPKG_TRIPLET: x86-windows
   VCPKG_PACKAGES: cpprestsdk[core,brotli,compression] openssl zlib mdnsresponder dirent
   VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
@@ -46,14 +48,20 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
-          key: vcpkg-${{ env.VCPKG_TRIPLET }}-v1-${{ github.run_id }}
-          restore-keys: vcpkg-${{ env.VCPKG_TRIPLET }}-v1-
+          key: vcpkg-${{ env.VCPKG_RELEASE }}-${{ env.VCPKG_TRIPLET }}-${{ github.run_id }}
+          restore-keys: vcpkg-${{ env.VCPKG_RELEASE }}-${{ env.VCPKG_TRIPLET }}-
 
+      # cpprestsdk has been removed from the latest vcpkg, so use a release that still has it.
       - name: Install vcpkg dependencies
         shell: pwsh
         run: |
+          git clone --depth 1 --branch $env:VCPKG_RELEASE https://github.com/microsoft/vcpkg $env:VCPKG_ROOT
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
           New-Item -ItemType Directory -Force $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
-          $vcpkg = Join-Path $env:VCPKG_INSTALLATION_ROOT 'vcpkg.exe'
+          $vcpkg = Join-Path $env:VCPKG_ROOT 'vcpkg.exe'
           & $vcpkg install --triplet $env:VCPKG_TRIPLET ($env:VCPKG_PACKAGES -split ' ')
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & $vcpkg integrate install
