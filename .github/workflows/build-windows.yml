@@ -10,8 +10,6 @@ permissions:
 
 env:
   ALTSERVER_VERSION: 1.8.1
-  VCPKG_RELEASE: 2024.11.16
-  VCPKG_ROOT: C:\vcpkg-altserver
   VCPKG_TRIPLET: x86-windows
   VCPKG_PACKAGES: cpprestsdk[core,brotli,compression] openssl zlib mdnsresponder dirent
   VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
@@ -45,26 +43,29 @@ jobs:
           Copy-Item regex-bin\bin\regex2.dll AltSign\Dependencies\regex\bin\
 
       - name: Restore vcpkg cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
-          key: vcpkg-${{ env.VCPKG_RELEASE }}-${{ env.VCPKG_TRIPLET }}-${{ github.run_id }}
-          restore-keys: vcpkg-${{ env.VCPKG_RELEASE }}-${{ env.VCPKG_TRIPLET }}-
+          key: vcpkg-${{ env.VCPKG_TRIPLET }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: vcpkg-${{ env.VCPKG_TRIPLET }}-
 
-      # cpprestsdk has been removed from the latest vcpkg, so use a release that still has it.
+      # cpprestsdk has been removed from vcpkg, so it's provided as an overlay port (copied from vcpkg 2024.11.16).
       - name: Install vcpkg dependencies
         shell: pwsh
         run: |
-          git clone --depth 1 --branch $env:VCPKG_RELEASE https://github.com/microsoft/vcpkg $env:VCPKG_ROOT
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-
+          Write-Host "vcpkg revision: $(git -C $env:VCPKG_INSTALLATION_ROOT rev-parse HEAD)"
           New-Item -ItemType Directory -Force $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
-          $vcpkg = Join-Path $env:VCPKG_ROOT 'vcpkg.exe'
-          & $vcpkg install --triplet $env:VCPKG_TRIPLET ($env:VCPKG_PACKAGES -split ' ')
+          $vcpkg = Join-Path $env:VCPKG_INSTALLATION_ROOT 'vcpkg.exe'
+          & $vcpkg install --triplet $env:VCPKG_TRIPLET --overlay-ports=.github\vcpkg-ports ($env:VCPKG_PACKAGES -split ' ')
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & $vcpkg integrate install
+
+      # Save right away so later build failures don't throw away the compiled dependencies.
+      - name: Save vcpkg cache
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-${{ env.VCPKG_TRIPLET }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # The projects target VS 2026 (v145) and libimobiledevice-vs targets VS 2019 (v142),
       # so retarget them to the newest toolset installed on the runner. ldid keeps ClangCL.
