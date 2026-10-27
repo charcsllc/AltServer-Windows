@@ -1,0 +1,143 @@
+name: Build AltServer (Windows)
+
+on:
+  push:
+    branches: [fix-80046]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  ALTSERVER_VERSION: 1.8.1
+  VCPKG_TRIPLET: x86-windows
+  VCPKG_PACKAGES: cpprestsdk[core,brotli,compression] openssl zlib mdnsresponder dirent
+  VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
+
+jobs:
+  build:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # libimobiledevice-vs only contains the Visual Studio projects; the sources live in separate repositories (see get-source.cmd).
+      - name: Fetch libimobiledevice sources
+        shell: pwsh
+        working-directory: Dependencies/libimobiledevice-vs
+        run: |
+          foreach ($repo in 'libplist', 'libusbmuxd', 'libimobiledevice') {
+            git clone --depth 1 --single-branch --branch msvc/master "https://github.com/libimobiledevice-win32/$repo" $repo
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            Write-Host "$repo revision: $(git -C $repo rev-parse HEAD)"
+          }
+
+      # ldid links against GnuWin32 regex (AltSign/Dependencies/regex), whose DLL isn't checked in.
+      - name: Download GnuWin32 regex runtime
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://downloads.sourceforge.net/project/gnuwin32/regex/2.7/regex-2.7-bin.zip" -OutFile regex-bin.zip -UserAgent "Wget"
+          Expand-Archive regex-bin.zip -DestinationPath regex-bin
+          New-Item -ItemType Directory -Force AltSign\Dependencies\regex\bin | Out-Null
+          Copy-Item regex-bin\bin\regex2.dll AltSign\Dependencies\regex\bin\
+
+      - name: Restore vcpkg cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-${{ env.VCPKG_TRIPLET }}-v1-${{ github.run_id }}
+          restore-keys: vcpkg-${{ env.VCPKG_TRIPLET }}-v1-
+
+      - name: Install vcpkg dependencies
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          $vcpkg = Join-Path $env:VCPKG_INSTALLATION_ROOT 'vcpkg.exe'
+          & $vcpkg install --triplet $env:VCPKG_TRIPLET ($env:VCPKG_PACKAGES -split ' ')
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $vcpkg integrate install
+
+      # The projects target VS 2026 (v145) and libimobiledevice-vs targets VS 2019 (v142),
+      # so retarget them to the newest toolset installed on the runner. ldid keeps ClangCL.
+      - name: Select platform toolset
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $toolsets = Get-ChildItem "$vs\MSBuild\Microsoft\VC\*\Platforms\Win32\PlatformToolsets" -Directory | Select-Object -ExpandProperty Name | Sort-Object -Unique
+          Write-Host "Visual Studio: $vs"
+          Write-Host "Available toolsets: $($toolsets -join ', ')"
+
+          $toolset = @('v145', 'v143') | Where-Object { $toolsets -contains $_ } | Select-Object -First 1
+          if (-not $toolset) { throw "No supported MSVC toolset found." }
+          if ($toolsets -notcontains 'ClangCL') { throw "ClangCL toolset (required by ldid) is not installed." }
+          Write-Host "Using toolset $toolset"
+
+          $projects = @(
+            'AltServer\AltServer.vcxproj',
+            'AltSign\AltSign.vcxproj',
+            'Dependencies\libimobiledevice-vs\libplist.vcxproj',
+            'Dependencies\libimobiledevice-vs\libusbmuxd.vcxproj',
+            'Dependencies\libimobiledevice-vs\imobiledevice.vcxproj'
+          )
+          foreach ($project in $projects) {
+            $path = Join-Path $env:GITHUB_WORKSPACE $project
+            $contents = [IO.File]::ReadAllText($path)
+            $contents = $contents -replace '<PlatformToolset>v14\d</PlatformToolset>', "<PlatformToolset>$toolset</PlatformToolset>"
+            $contents = $contents -replace '<WindowsTargetPlatformVersion>10</WindowsTargetPlatformVersion>', '<WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>'
+            [IO.File]::WriteAllText($path, $contents)
+          }
+
+          "VS_INSTALL_PATH=$vs" >> $env:GITHUB_ENV
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build AltServer
+        run: msbuild AltServer.sln /t:AltServer /p:Configuration=Release /p:Platform=x86 /m /v:minimal
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $dist = "dist\AltServer-$env:ALTSERVER_VERSION"
+          New-Item -ItemType Directory -Force $dist | Out-Null
+
+          # AltServer.exe, ldid.dll and the vcpkg DLLs copied next to them.
+          Copy-Item Release\AltServer.exe, Release\*.dll $dist
+          # imobiledevice.dll, plist.dll and usbmuxd.dll.
+          Copy-Item Win32\Release\*.dll $dist
+          Copy-Item AltSign\Dependencies\regex\bin\regex2.dll, Dependencies\Libraries\WinSparkle.dll $dist
+          foreach ($dll in 'libcrypto-3.dll', 'libssl-3.dll') {
+            if (-not (Test-Path "$dist\$dll")) { Copy-Item "Dependencies\Libraries\$dll" $dist }
+          }
+
+          # Ship the C++ runtime matching the toolset AltServer was built with.
+          $crt = Get-ChildItem "$env:VS_INSTALL_PATH\VC\Redist\MSVC\*\x86\Microsoft.VC14*.CRT" -Directory | Sort-Object FullName -Descending | Select-Object -First 1
+          Copy-Item "$($crt.FullName)\*.dll" $dist
+
+          Get-ChildItem $dist | Format-Table Name, Length
+          Compress-Archive "$dist\*" "dist\AltServer-$env:ALTSERVER_VERSION-win32.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AltServer-${{ env.ALTSERVER_VERSION }}-win32
+          path: dist/AltServer-${{ env.ALTSERVER_VERSION }}
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $tag = "v$env:ALTSERVER_VERSION"
+          $notes = @"
+          Unofficial AltServer for Windows $env:ALTSERVER_VERSION, built from ``$env:GITHUB_REF_NAME`` ($env:GITHUB_SHA).
+
+          Works around Apple error -80046 ("This action cannot be completed at this time") by claiming to be a Mac when requesting the Xcode auth token, while still signing in with the native Windows client info.
+
+          This build is untested. To try it, quit AltServer, back up your AltServer installation folder, then replace its contents with the files in the zip.
+          "@
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) { gh release delete $tag --cleanup-tag --yes }
+
+          gh release create $tag "dist\AltServer-$env:ALTSERVER_VERSION-win32.zip" --target $env:GITHUB_SHA --prerelease --title "AltServer $env:ALTSERVER_VERSION (fix -80046)" --notes $notes
