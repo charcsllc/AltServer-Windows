@@ -112,8 +112,9 @@ jobs:
 
       - uses: microsoft/setup-msbuild@v2
 
+      # The solution doesn't declare the dependencies between the libimobiledevice projects, so build them in order.
       - name: Build AltServer
-        run: msbuild AltServer.sln /t:AltServer /p:Configuration=Release /p:Platform=x86 /m /v:minimal
+        run: msbuild AltServer.sln "/t:plist;usbmuxd;imobiledevice;AltServer" /p:Configuration=Release /p:Platform=x86 /v:minimal
 
       - name: Package
         shell: pwsh
