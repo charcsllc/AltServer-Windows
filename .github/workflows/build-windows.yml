@@ -84,7 +84,7 @@ jobs:
         shell: pwsh
         run: |
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          $toolsets = Get-ChildItem "$vs\MSBuild\Microsoft\VC\*\Platforms\Win32\PlatformToolsets" -Directory | Select-Object -ExpandProperty Name | Sort-Object -Unique
+          $toolsets = Get-ChildItem "$vs\MSBuild\Microsoft\VC\*\Platforms\Win32\PlatformToolsets\*" -Directory | Select-Object -ExpandProperty Name | Sort-Object -Unique
           Write-Host "Visual Studio: $vs"
           Write-Host "Available toolsets: $($toolsets -join ', ')"
 
