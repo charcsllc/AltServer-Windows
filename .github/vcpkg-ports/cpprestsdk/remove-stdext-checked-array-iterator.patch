@@ -1,0 +1,57 @@
+diff --git a/Release/include/cpprest/containerstream.h b/Release/include/cpprest/containerstream.h
+index 6e949a7..3a60ebe 100644
+--- a/Release/include/cpprest/containerstream.h
++++ b/Release/include/cpprest/containerstream.h
+@@ -399,7 +399,7 @@ private:
+         auto readBegin = std::begin(m_data) + m_current_position;
+         auto readEnd = std::begin(m_data) + newPos;
+ 
+-#if defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL != 0
++#if 0 // stdext::checked_array_iterator has been removed from the MSVC STL
+         // Avoid warning C4996: Use checked iterators under SECURE_SCL
+         std::copy(readBegin, readEnd, stdext::checked_array_iterator<_CharType*>(ptr, count));
+ #else
+diff --git a/Release/include/cpprest/producerconsumerstream.h b/Release/include/cpprest/producerconsumerstream.h
+index 3487c46..dbe861d 100644
+--- a/Release/include/cpprest/producerconsumerstream.h
++++ b/Release/include/cpprest/producerconsumerstream.h
+@@ -439,7 +439,7 @@ private:
+             _CharType* beg = rbegin();
+             _CharType* end = rbegin() + countRead;
+ 
+-#if defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL != 0
++#if 0 // stdext::checked_array_iterator has been removed from the MSVC STL
+             // Avoid warning C4996: Use checked iterators under SECURE_SCL
+             std::copy(beg, end, stdext::checked_array_iterator<_CharType*>(dest, count));
+ #else
+@@ -462,7 +462,7 @@ private:
+ 
+             const _CharType* srcEnd = src + countWritten;
+ 
+-#if defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL != 0
++#if 0 // stdext::checked_array_iterator has been removed from the MSVC STL
+             // Avoid warning C4996: Use checked iterators under SECURE_SCL
+             std::copy(src, srcEnd, stdext::checked_array_iterator<_CharType*>(wbegin(), static_cast<size_t>(avail)));
+ #else
+diff --git a/Release/include/cpprest/rawptrstream.h b/Release/include/cpprest/rawptrstream.h
+index 1f15ecb..567a54f 100644
+--- a/Release/include/cpprest/rawptrstream.h
++++ b/Release/include/cpprest/rawptrstream.h
+@@ -439,7 +439,7 @@ private:
+         auto readBegin = m_data + m_current_position;
+         auto readEnd = m_data + newPos;
+ 
+-#if defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL != 0
++#if 0 // stdext::checked_array_iterator has been removed from the MSVC STL
+         // Avoid warning C4996: Use checked iterators under SECURE_SCL
+         std::copy(readBegin, readEnd, stdext::checked_array_iterator<_CharType*>(ptr, count));
+ #else
+@@ -466,7 +466,7 @@ private:
+         if (newSize > m_size) throw std::runtime_error("Writing past the end of the buffer");
+ 
+             // Copy the data
+-#if defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL != 0
++#if 0 // stdext::checked_array_iterator has been removed from the MSVC STL
+         // Avoid warning C4996: Use checked iterators under SECURE_SCL
+         std::copy(ptr, ptr + count, stdext::checked_array_iterator<_CharType*>(m_data, m_size, m_current_position));
+ #else

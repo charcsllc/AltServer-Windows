@@ -67,6 +67,17 @@ jobs:
           path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
           key: vcpkg-${{ env.VCPKG_TRIPLET }}-${{ github.run_id }}-${{ github.run_attempt }}
 
+      # ldid looks for OpenSSL 3 where the official Win32 installer puts it, before falling back to
+      # Dependencies\Libraries (which only has OpenSSL 1.1 import libraries), so put vcpkg's OpenSSL there.
+      - name: Provide OpenSSL for ldid
+        shell: pwsh
+        run: |
+          $openssl = "${env:ProgramFiles(x86)}\OpenSSL-3-Win32"
+          $installed = "$env:VCPKG_INSTALLATION_ROOT\installed\$env:VCPKG_TRIPLET"
+          New-Item -ItemType Directory -Force "$openssl\include", "$openssl\lib" | Out-Null
+          Copy-Item -Recurse -Force "$installed\include\openssl" "$openssl\include\"
+          Copy-Item "$installed\lib\libssl.lib", "$installed\lib\libcrypto.lib" "$openssl\lib\"
+
       # The projects target VS 2026 (v145) and libimobiledevice-vs targets VS 2019 (v142),
       # so retarget them to the newest toolset installed on the runner. ldid keeps ClangCL.
       - name: Select platform toolset
