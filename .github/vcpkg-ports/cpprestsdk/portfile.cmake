@@ -10,7 +10,7 @@ vcpkg_from_github(
         fix-uwp.patch
         fix-clang-dllimport.patch # workaround for https://github.com/microsoft/cpprestsdk/issues/1710
         silence-stdext-checked-array-iterators-warning.patch
-        remove-stdext-checked-array-iterator.patch # stdext::checked_array_iterator was removed in VS 2026
+        remove-removed-msvc-stl-extensions.patch # stdext::checked_array_iterator and std::ios_base::_Openprot were removed in VS 2026
 )
 
 set(OPTIONS)

@@ -11,6 +11,37 @@ index 6e949a7..3a60ebe 100644
          // Avoid warning C4996: Use checked iterators under SECURE_SCL
          std::copy(readBegin, readEnd, stdext::checked_array_iterator<_CharType*>(ptr, count));
  #else
+diff --git a/Release/include/cpprest/filestream.h b/Release/include/cpprest/filestream.h
+index 1e4a0f2..336a054 100644
+--- a/Release/include/cpprest/filestream.h
++++ b/Release/include/cpprest/filestream.h
+@@ -715,7 +715,7 @@ private:
+         const utility::string_t& _Filename,
+         std::ios_base::openmode _Mode = std::ios_base::out,
+ #ifdef _WIN32
+-        int _Prot = (int)std::ios_base::_Openprot
++        int _Prot = 0x40 /* _SH_DENYNO, std::ios_base::_Openprot has been removed from the MSVC STL */
+ #else
+         int _Prot = 0                                         // unsupported on Linux, for now
+ #endif
+@@ -1012,7 +1012,7 @@ public:
+     static pplx::task<streams::basic_istream<_CharType>> open_istream(const utility::string_t& file_name,
+                                                                       std::ios_base::openmode mode = std::ios_base::in,
+ #ifdef _WIN32
+-                                                                      int prot = (int)std::ios_base::_Openprot
++                                                                      int prot = 0x40 /* _SH_DENYNO, std::ios_base::_Openprot has been removed from the MSVC STL */
+ #else
+                                                                       int prot = 0
+ #endif
+@@ -1037,7 +1037,7 @@ public:
+     static pplx::task<streams::basic_ostream<_CharType>> open_ostream(const utility::string_t& file_name,
+                                                                       std::ios_base::openmode mode = std::ios_base::out,
+ #ifdef _WIN32
+-                                                                      int prot = (int)std::ios_base::_Openprot
++                                                                      int prot = 0x40 /* _SH_DENYNO, std::ios_base::_Openprot has been removed from the MSVC STL */
+ #else
+                                                                       int prot = 0
+ #endif
 diff --git a/Release/include/cpprest/producerconsumerstream.h b/Release/include/cpprest/producerconsumerstream.h
 index 3487c46..dbe861d 100644
 --- a/Release/include/cpprest/producerconsumerstream.h
