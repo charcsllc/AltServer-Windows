@@ -1,0 +1,8 @@
+<Project>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- AltSign and libimobiledevice still use APIs deprecated in OpenSSL 3, which /sdl turns into errors. -->
+      <PreprocessorDefinitions>OPENSSL_SUPPRESS_DEPRECATED;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+</Project>

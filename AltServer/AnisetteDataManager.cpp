@@ -11,6 +11,7 @@
 
 #include "AnisetteData.h"
 #include "AltServerApp.h"
+#include "RemoteAnisetteProvider.h"
 
 //#define SPOOF_MAC 1
 
@@ -75,7 +76,7 @@ id __cdecl ALTClientInfoReplacementFunction(void*)
 	ObjcObject* NSString = (ObjcObject*)objc_getClass("NSString");
 	id stringInit = sel_registerName("stringWithUTF8String:");
 
-	ObjcObject* clientInfo = (ObjcObject*)((id(*)(id, SEL, const char*))objc_msgSend)(NSString, stringInit, "<MacBookPro15,1> <Mac OS X;10.15.2;19C57> <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>");
+	ObjcObject* clientInfo = (ObjcObject*)((id(*)(id, SEL, const char*))objc_msgSend)(NSString, stringInit, "<MacBookPro15,1> <macOS;13.2;22D49> <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>");
 
 	odslog("Swizzled Client Info: " << clientInfo->description());
 
@@ -189,6 +190,8 @@ bool AnisetteDataManager::LoadiCloudDependencies()
 		return false;
 	}
 
+	#if SPOOF_MAC
+
 	{
 		/** Client Info Swizzling */
 
@@ -266,6 +269,8 @@ bool AnisetteDataManager::LoadiCloudDependencies()
 			functionImplementation[i] = instruction[i];
 		}
 	}
+
+	#endif
 }
 
 bool AnisetteDataManager::LoadDependencies()
@@ -327,9 +332,7 @@ bool AnisetteDataManager::LoadDependencies()
 		FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, GetLastError(), 
 			MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), buffer, 256, NULL);
 
-		auto error = AnisetteError(AnisetteErrorCode::InvalidiTunesInstallation);
-		error.setLocalizedDescription(buffer);
-		throw error;
+		throw AnisetteError(AnisetteErrorCode::InvalidiTunesInstallation, { {NSLocalizedDescriptionKey, buffer} });
 	}
 
 	/* Objective-C runtime functions */
@@ -348,12 +351,10 @@ bool AnisetteDataManager::LoadDependencies()
 		throw AnisetteError(AnisetteErrorCode::InvalidiTunesInstallation);
 	}
 
-#if SPOOF_MAC
 	if (!this->LoadiCloudDependencies())
 	{
 		return false;
 	}
-#endif
 
 	this->loadedDependencies = true;
 
@@ -362,17 +363,20 @@ bool AnisetteDataManager::LoadDependencies()
 
 std::shared_ptr<AnisetteData> AnisetteDataManager::FetchAnisetteData()
 {
+	if (RemoteAnisetteProvider::isEnabled())
+	{
+		return RemoteAnisetteProvider::instance()->FetchAnisetteData();
+	}
+
 	if (!this->loadedDependencies)
 	{
 		this->LoadDependencies();
 	}
 
-#if SPOOF_MAC
 	if (GetClientInfo == NULL || GetDeviceID == NULL || GetLocalUserID == NULL)
 	{
 		return NULL;
 	}
-#endif
 
 	std::shared_ptr<AnisetteData> anisetteData = NULL;
 
@@ -402,24 +406,14 @@ std::shared_ptr<AnisetteData> AnisetteDataManager::FetchAnisetteData()
 
 		/* Device Hardware */
 
-		ObjcObject* deviceDescription = (ObjcObject*)ALTClientInfoReplacementFunction(NULL);
-		ObjcObject* deviceID = (ObjcObject*)ALTDeviceIDReplacementFunction();
+		ObjcObject* deviceDescription = (ObjcObject*)GetClientInfo(NULL);
+		ObjcObject* deviceID = (ObjcObject*)GetDeviceID();
+		ObjcObject* localUserID = (ObjcObject*)GetLocalUserID();
 
 		if (deviceDescription == NULL || deviceID == NULL)
 		{
 			return;
 		}
-
-#if SPOOF_MAC
-		ObjcObject* localUserID = (ObjcObject*)GetLocalUserID();
-#else
-		std::string description = deviceID->description();
-
-		std::vector<unsigned char> deviceIDData(description.begin(), description.end());
-		auto encodedDeviceID = StringFromWideString(utility::conversions::to_base64(deviceIDData));
-
-		ObjcObject* localUserID = (ObjcObject*)((id(*)(id, SEL, const char*))objc_msgSend)(NSString, stringInit, encodedDeviceID.c_str());
-#endif
 
 		std::string deviceSerialNumber = "C02LKHBBFD57";
 
@@ -438,7 +432,7 @@ std::shared_ptr<AnisetteData> AnisetteDataManager::FetchAnisetteData()
 			machineID->description(),
 			otp->description(),
 			localUserID->description(),
-			17106176,
+			84215040,
 			deviceID->description(),
 			deviceSerialNumber,
 			deviceDescription->description(),
@@ -563,6 +557,12 @@ bool AnisetteDataManager::ReprovisionDevice(std::function<void(void)> provisionC
 
 bool AnisetteDataManager::ResetProvisioning()
 {
+	if (RemoteAnisetteProvider::isEnabled())
+	{
+		RemoteAnisetteProvider::instance()->ResetProvisioning();
+		return true;
+	}
+
 	std::string adiDirectoryPath = "C:\\ProgramData\\Apple Computer\\iTunes\\adi";
 
 	// Remove existing AltServer .pb files so we can create new ones next time we provision this device.

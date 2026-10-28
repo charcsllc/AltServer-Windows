@@ -20,6 +20,7 @@
 #include <plist/plist.h>
 
 #include "ProvisioningProfile.hpp"
+#include "Device.hpp"
 
 class Application
 {
@@ -40,6 +41,9 @@ public:
 	std::shared_ptr<ProvisioningProfile> provisioningProfile();
 	std::vector<std::shared_ptr<Application>> appExtensions() const;
 
+    OperatingSystemVersion minimumOSVersion() const;
+    Device::Type supportedDeviceTypes() const;
+
 	std::map<std::string, plist_t> entitlements();
 
 	bool isAltStoreApp() const;
@@ -53,6 +57,9 @@ private:
     std::string _path;
 
 	std::shared_ptr<ProvisioningProfile> _provisioningProfile;
+
+    OperatingSystemVersion _minimumOSVersion;
+    Device::Type _supportedDeviceTypes;
 
 	std::string _entitlementsString;
 	std::map<std::string, plist_t> _entitlements;

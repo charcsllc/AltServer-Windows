@@ -25,6 +25,13 @@ extern "C" {
 
 #include <cpprest/http_compression.h>
 
+#include <WinSock2.h>
+#include <windows.h>
+#include <winhttp.h>
+#pragma comment(lib, "winhttp.lib")
+
+#include <zlib.h>
+
 #include <openssl/pem.h>
 #include <openssl/pkcs12.h>
 
@@ -54,47 +61,42 @@ extern std::wstring WideStringFromString(std::string string);
 
 bool decompress(const uint8_t* input, size_t input_size, std::vector<uint8_t>& output)
 {
-    auto decompressor = web::http::compression::builtin::make_decompressor(web::http::compression::builtin::algorithm::GZIP);
-    
     // Need to guard against attempting to decompress when we're already finished or encountered an error!
     if (input == nullptr || input_size == 0)
     {
         return false;
     }
-    
-    size_t processed;
-    size_t got;
-    size_t inbytes = 0;
-    size_t outbytes = 0;
-    bool done;
-    
-    try
-    {
-        output.resize(input_size * 3);
-        do
-        {
-            if (inbytes)
-            {
-                output.resize(output.size() + (std::max)(input_size, static_cast<size_t>(1024)));
-            }
-            got = decompressor->decompress(input + inbytes,
-                                             input_size - inbytes,
-                                             output.data() + outbytes,
-                                             output.size() - outbytes,
-                                           web::http::compression::operation_hint::is_last,
-                                             processed,
-                                             done);
-            inbytes += processed;
-            outbytes += got;
-        } while (got && !done);
-        output.resize(outbytes);
-    }
-    catch (...)
+
+    // Use zlib directly, since cpprestsdk's builtin GZIP decompressor is null when cpprestsdk is built without compression support.
+    z_stream stream = {};
+    if (inflateInit2(&stream, 15 + 32) != Z_OK) // 15 + 32 = detect gzip or zlib header automatically.
     {
         return false;
     }
-    
-    return true;
+
+    stream.next_in = (Bytef*)input;
+    stream.avail_in = (uInt)input_size;
+
+    output.resize(input_size * 3);
+
+    int result = Z_OK;
+    while (result == Z_OK)
+    {
+        if (stream.total_out >= output.size())
+        {
+            output.resize(output.size() + (std::max)(input_size, static_cast<size_t>(1024)));
+        }
+
+        stream.next_out = output.data() + stream.total_out;
+        stream.avail_out = (uInt)(output.size() - stream.total_out);
+
+        result = inflate(&stream, Z_NO_FLUSH);
+    }
+
+    output.resize(stream.total_out);
+    inflateEnd(&stream);
+
+    return (result == Z_STREAM_END);
 }
 
 AppleAPI* AppleAPI::instance_ = nullptr;
@@ -109,12 +111,8 @@ AppleAPI* AppleAPI::getInstance()
     return instance_;
 }
 
-AppleAPI::AppleAPI() : _servicesClient(U("https://developerservices2.apple.com/services/v1")), _client(U("https://developerservices2.apple.com/services/QH65B2")), _gsaClient(U("https://gsa.apple.com"))
+AppleAPI::AppleAPI() : _servicesClient(U("https://developerservices2.apple.com/services/v1")), _client(U("https://developerservices2.apple.com/services/QH65B2"))
 {
-	http_client_config config;
-	config.set_validate_certificates(false);
-
-	_gsaClient = web::http::client::http_client(U("https://gsa.apple.com"), config);
 
 //    volatile long response_counter = 0;
 //    auto response_count_handler =
@@ -614,6 +612,15 @@ pplx::task<bool> AppleAPI::AssignAppIDToGroups(std::shared_ptr<AppID> appID, std
 							throw APIError(APIErrorCode::InvalidResponse);
 						}
 
+						uint64_t resultCode = 0;
+						plist_get_uint_val(node, &resultCode);
+
+						if (resultCode != 0)
+						{
+							// Need to throw an exception for resultCodeHandler to be called.
+							throw APIError(APIErrorCode::InvalidAppGroup);
+						}
+
 						return true;
 
 					}, [=](auto resultCode) -> std::optional<APIError>
@@ -712,6 +719,15 @@ pplx::task<bool> AppleAPI::DeleteProvisioningProfile(std::shared_ptr<Provisionin
                                                              {
                                                                  throw APIError(APIErrorCode::InvalidResponse);
                                                              }
+
+															 uint64_t resultCode = 0;
+															 plist_get_uint_val(node, &resultCode);
+
+															 if (resultCode != 0)
+															 {
+																 // Need to throw an exception for resultCodeHandler to be called.
+																 throw APIError(APIErrorCode::InvalidProvisioningProfileIdentifier);
+															 }
                                                              
                                                              return true;
                                                              
@@ -994,5 +1010,15 @@ web::http::client::http_client AppleAPI::client()
 
 web::http::client::http_client AppleAPI::gsaClient()
 {
-	return this->_gsaClient;
+	// Create a new client, and disable keep-alive to ensure only one HTTP connection is active at a time.
+	// Otherwise, Apple's servers may reject connections with more than 2 requests.
+	http_client_config config;
+	config.set_validate_certificates(false);
+	config.set_nativehandle_options([](web::http::client::native_handle handle)
+		{
+			DWORD feature = WINHTTP_DISABLE_KEEP_ALIVE;
+			WinHttpSetOption(handle, WINHTTP_OPTION_DISABLE_FEATURE, &feature, sizeof(feature));
+		});
+
+	return web::http::client::http_client(U("https://gsa.apple.com"), config);
 }

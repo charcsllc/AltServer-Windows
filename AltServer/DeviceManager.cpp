@@ -14,6 +14,7 @@
 #include <libimobiledevice/notification_proxy.h>
 #include <libimobiledevice/afc.h>
 #include <libimobiledevice/misagent.h>
+#include <libimobiledevice/src/idevice.h>
 
 #include <filesystem>
 
@@ -27,6 +28,9 @@
 #include "ProvisioningProfile.hpp"
 #include "Application.hpp"
 
+#include "ConnectionError.hpp"
+#include "WindowsError.h"
+
 #include <WinSock2.h>
 
 #define DEVICE_LISTENING_SOCKET 28151
@@ -39,6 +43,7 @@ extern std::wstring WideStringFromString(std::string string);
 void DeviceManagerUpdateStatus(plist_t command, plist_t status, void *udid);
 void DeviceManagerUpdateAppDeletionStatus(plist_t command, plist_t status, void* udid);
 void DeviceDidChangeConnectionStatus(const idevice_event_t* event, void* user_data);
+ssize_t DeviceManagerUploadFile(void* buffer, size_t size, void* user_data);
 
 namespace fs = std::filesystem;
 
@@ -223,7 +228,8 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 			}
 
 			/* Find Device */
-			if (idevice_new(&device, deviceUDID.c_str()) != IDEVICE_E_SUCCESS)
+
+			if (idevice_new_with_options(&device, deviceUDID.c_str(), (enum idevice_options)((int)IDEVICE_LOOKUP_NETWORK | (int)IDEVICE_LOOKUP_USBMUX)) != IDEVICE_E_SUCCESS)
 			{
 				throw ServerError(ServerErrorCode::DeviceNotFound);
 			}
@@ -262,6 +268,24 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 			if (misagent_client_new(device, service, &mis) != MISAGENT_E_SUCCESS)
 			{
 				throw ServerError(ServerErrorCode::ConnectionFailed);
+			}
+
+
+			/* Get iOS Version */
+			plist_t device_version_plist = NULL;
+			char* device_version_string = NULL;
+			OperatingSystemVersion osVersion = { 18, 0, 0 };
+
+			if (lockdownd_get_value(client, NULL, "ProductVersion", &device_version_plist) == LOCKDOWN_E_SUCCESS && device_version_plist != NULL)
+			{
+				plist_get_string_val(device_version_plist, &device_version_string);
+				if (device_version_string != NULL)
+				{
+					osVersion = OperatingSystemVersion(device_version_string);
+					free(device_version_string);
+				}
+
+				plist_free(device_version_plist);
 			}
 
 
@@ -321,7 +345,7 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 
 			try
 			{
-				this->WriteDirectory(afc, appBundlePath.string(), destinationPath.string(), [&writtenFiles, numberOfFiles, progressCompletionHandler](std::string filepath) {
+				this->WriteDirectory(afc, appBundlePath.string(), destinationPath.string(), [numberOfFiles, &writtenFiles, &progressCompletionHandler](std::string filepath) {
 					writtenFiles++;
 
 					double progress = (double)writtenFiles / (double)numberOfFiles;
@@ -345,23 +369,11 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 			}
 			catch (std::exception& exception)
 			{
-				if (application->bundleIdentifier().find("science.xnu.undecimus") != std::string::npos)
+				if (application->bundleIdentifier().find("science.xnu.undecimus") != std::string::npos && 
+					std::string(exception.what()) == std::string("vector<T> too long"))
 				{
-					std::map<std::string, std::string> userInfo = {
-						{ "NSLocalizedDescription", exception.what() },
-						{ "NSLocalizedRecoverySuggestion", "Make sure Windows real-time protection is disabled on your computer then try again." }
-					};
-
-					if (std::string(exception.what()) == std::string("vector<T> too long"))
-					{
-						userInfo["NSLocalizedFailureReason"] = "Windows Defender Blocked Installation";
-					}
-					else
-					{
-						userInfo["NSLocalizedFailureReason"] = exception.what();
-					}
-
-					throw ServerError(ServerErrorCode::Unknown, userInfo);
+					std::shared_ptr<Error> underlyingError(new ExceptionError(exception));
+					throw WindowsError(WindowsErrorCode::WindowsDefenderBlockedCommunication, { {NSUnderlyingErrorKey, underlyingError } });
 				}
 				else
 				{
@@ -378,10 +390,15 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 				service = NULL;
 			}
 
-			/* Provisioning Profiles */			
-			bool shouldManageProfiles = (activeProfiles.has_value() || (application->provisioningProfile() != NULL && application->provisioningProfile()->isFreeProvisioningProfile()));
+			/* Provisioning Profiles */		
+
+			// As of iOS 18, removing all provisioning profiles causes apps to become unverified.
+			// Thankfully this technique is no longer necessary, so only remove profiles on devices running iOS 17.x or earlier.
+			bool isAtLeastiOS18 = (osVersion.majorVersion >= 18);
+			bool shouldManageProfiles = !isAtLeastiOS18 && (activeProfiles.has_value() || (application->provisioningProfile() != NULL && application->provisioningProfile()->isFreeProvisioningProfile()));
+
 			if (shouldManageProfiles)
-			{				
+			{
 				// Free developer account was used to sign this app, so we need to remove all
 				// provisioning profiles in order to remain under sideloaded app limit.
 
@@ -411,13 +428,13 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 			std::condition_variable cv;
 
 			std::optional<ServerError> serverError = std::nullopt;
-			std::optional<LocalizedError> localizedError = std::nullopt;
 
 			bool didBeginInstalling = false;
 			bool didFinishInstalling = false;
 
-			this->_installationProgressHandlers[UUID] = [device, client, ipc, afc, mis, service, finish, progressCompletionHandler, 
-				&waitingMutex, &cv, &didBeginInstalling, &didFinishInstalling, &serverError, &localizedError](double progress, int resultCode, char *name, char *description) {
+			// Capture &finish by reference to avoid implicit copies of installedProfiles and cachedProfiles, resulting in memory leaks.
+			this->_installationProgressHandlers[UUID] = [device, client, ipc, afc, mis, service, application, &finish, &progressCompletionHandler,
+				&waitingMutex, &cv, &didBeginInstalling, &didFinishInstalling, &serverError](double progress, int resultCode, char *name, char *description) {
 				double weightedProgress = progress * 0.25;
 				double adjustedProgress = weightedProgress + 0.75;
 
@@ -427,8 +444,8 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 					{
 						if (resultCode == -402620383)
 						{
-							std::map<std::string, std::string> userInfo = {
-								{ "NSLocalizedRecoverySuggestion", "Make sure 'Offload Unused Apps' is disabled in Settings > iTunes & App Stores, then install or delete all offloaded apps." }
+							std::map<std::string, std::any> userInfo = {
+                                { NSLocalizedDescriptionKey, description },
 							};
 							serverError = std::make_optional<ServerError>(ServerErrorCode::MaximumFreeAppLimitReached, userInfo);
 						}
@@ -438,11 +455,35 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 
 							if (errorName == "DeviceOSVersionTooLow")
 							{
-								serverError = std::make_optional<ServerError>(ServerErrorCode::UnsupportediOSVersion);
+								Device::Type deviceType = Device::Type::iPhone;
+								if (application->supportedDeviceTypes() & Device::Type::AppleTV)
+								{
+									// App supports tvOS, so assume we're installing to Apple TV (because there are no "universal" tvOS binaries).
+									deviceType = Device::Type::AppleTV;
+								}
+
+								auto osName = ALTOperatingSystemNameForDeviceType(deviceType);
+								if (!osName.has_value())
+								{
+									osName = "iOS";
+								}
+
+								std::shared_ptr<Error> underlyingError(new LocalizedInstallationError(resultCode, description));
+
+								std::map<std::string, std::any> userInfo = {
+									{AppNameErrorKey, application->name()},
+									{OperatingSystemNameErrorKey, *osName},
+									{OperatingSystemVersionErrorKey, application->minimumOSVersion().stringValue()},
+									{NSUnderlyingErrorKey, underlyingError}
+								};
+								serverError = std::make_optional<ServerError>(ServerErrorCode::UnsupportediOSVersion, userInfo);
 							}
 							else
 							{
-								localizedError = std::make_optional<LocalizedError>(resultCode, description);
+								std::shared_ptr<Error> localizedError(new LocalizedInstallationError(resultCode, description));
+
+								std::map<std::string, std::any> userInfo = { {NSUnderlyingErrorKey, localizedError} };
+								serverError = std::make_optional<ServerError>(ServerErrorCode::InstallationFailed, userInfo);
 							}
 						}
 					}
@@ -462,8 +503,10 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 			auto narrowDestinationPath = StringFromWideString(destinationPath.c_str());
 			std::replace(narrowDestinationPath.begin(), narrowDestinationPath.end(), '\\', '/');
 
-			instproxy_install(ipc, narrowDestinationPath.c_str(), options, DeviceManagerUpdateStatus, uuidString);
-			instproxy_client_options_free(options);
+			pplx::create_task([ipc, narrowDestinationPath, options, uuidString] {
+				instproxy_install(ipc, narrowDestinationPath.c_str(), options, DeviceManagerUpdateStatus, uuidString);
+				instproxy_client_options_free(options);
+			});
 
 			// Wait until we're finished installing;
 			std::unique_lock<std::mutex> lock(waitingMutex);
@@ -474,12 +517,7 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 			if (serverError.has_value())
 			{
 				throw serverError.value();
-			}
-
-			if (localizedError.has_value())
-			{
-				throw localizedError.value();
-			}			
+			}		
 		}
 		catch (std::exception& exception)
 		{
@@ -593,7 +631,7 @@ pplx::task<void> DeviceManager::RemoveApp(std::string bundleIdentifier, std::str
 		try 
 		{
 			/* Find Device */
-			if (idevice_new(&device, deviceUDID.c_str()) != IDEVICE_E_SUCCESS)
+			if (idevice_new_with_options(&device, deviceUDID.c_str(), (enum idevice_options)((int)IDEVICE_LOOKUP_NETWORK | (int)IDEVICE_LOOKUP_USBMUX)) != IDEVICE_E_SUCCESS)
 			{
 				throw ServerError(ServerErrorCode::DeviceNotFound);
 			}
@@ -638,10 +676,8 @@ pplx::task<void> DeviceManager::RemoveApp(std::string bundleIdentifier, std::str
 			(bool success, int errorCode, char* errorName, char* errorDescription) {
 				if (!success)
 				{
-					std::map<std::string, std::string> userInfo = { 
-						{ "NSLocalizedFailure", ServerError(ServerErrorCode::AppDeletionFailed).localizedDescription() }, 
-						{ "NSLocalizedFailureReason", errorDescription } 
-					};
+					std::shared_ptr<Error> underlyingError(new LocalizedInstallationError(errorCode, errorDescription));
+					std::map<std::string, std::any> userInfo = { {NSUnderlyingErrorKey, underlyingError} };
 					serverError = std::make_optional<ServerError>(ServerErrorCode::AppDeletionFailed, userInfo);
 				}
 
@@ -681,7 +717,7 @@ pplx::task<std::shared_ptr<WiredConnection>> DeviceManager::StartWiredConnection
 		idevice_connection_t connection = NULL;
 
 		/* Find Device */
-		if (idevice_new_ignore_network(&device, altDevice->identifier().c_str()) != IDEVICE_E_SUCCESS)
+		if (idevice_new_with_options(&device, altDevice->identifier().c_str(), IDEVICE_LOOKUP_USBMUX) != IDEVICE_E_SUCCESS)
 		{
 			throw ServerError(ServerErrorCode::DeviceNotFound);
 		}
@@ -697,6 +733,16 @@ pplx::task<std::shared_ptr<WiredConnection>> DeviceManager::StartWiredConnection
 
 		auto wiredConnection = std::make_shared<WiredConnection>(altDevice, connection);
 		return wiredConnection;
+	});
+}
+
+pplx::task<std::shared_ptr<DebugConnection>> DeviceManager::StartDebugConnection(std::shared_ptr<Device> device)
+{
+	auto debugConnection = std::make_shared<DebugConnection>(device);
+
+	return debugConnection->Connect()
+	.then([=]() {
+		return debugConnection;
 	});
 }
 
@@ -739,7 +785,7 @@ pplx::task<void> DeviceManager::InstallProvisioningProfiles(std::vector<std::sha
 		try
 		{
 			/* Find Device */
-			if (idevice_new(&device, deviceUDID.c_str()) != IDEVICE_E_SUCCESS)
+			if (idevice_new_with_options(&device, deviceUDID.c_str(), (enum idevice_options)((int)IDEVICE_LOOKUP_NETWORK | (int)IDEVICE_LOOKUP_USBMUX)) != IDEVICE_E_SUCCESS)
 			{
 				throw ServerError(ServerErrorCode::DeviceNotFound);
 			}
@@ -841,7 +887,7 @@ pplx::task<void> DeviceManager::RemoveProvisioningProfiles(std::set<std::string>
 		try
 		{
 			/* Find Device */
-			if (idevice_new(&device, deviceUDID.c_str()) != IDEVICE_E_SUCCESS)
+			if (idevice_new_with_options(&device, deviceUDID.c_str(), (enum idevice_options)((int)IDEVICE_LOOKUP_NETWORK | (int)IDEVICE_LOOKUP_USBMUX)) != IDEVICE_E_SUCCESS)
 			{
 				throw ServerError(ServerErrorCode::DeviceNotFound);
 			}
@@ -978,10 +1024,7 @@ void DeviceManager::InstallProvisioningProfile(std::shared_ptr<ProvisioningProfi
 		{
 		case -402620383:
 		{
-			std::map<std::string, std::string> userInfo = {
-				{ "NSLocalizedRecoverySuggestion", "Make sure 'Offload Unused Apps' is disabled in Settings > iTunes & App Stores, then install or delete all offloaded apps." }
-			};
-			throw ServerError(ServerErrorCode::MaximumFreeAppLimitReached, userInfo);
+			throw ServerError(ServerErrorCode::MaximumFreeAppLimitReached);
 		}
 
 		default:
@@ -991,8 +1034,8 @@ void DeviceManager::InstallProvisioningProfile(std::shared_ptr<ProvisioningProfi
 
 			std::string localizedFailure = oss.str();
 
-			std::map<std::string, std::string> userInfo = {
-					{ LocalizedFailureErrorKey, localizedFailure },
+			std::map<std::string, std::any> userInfo = {
+					{ NSLocalizedFailureErrorKey, localizedFailure },
 					{ ProvisioningProfileBundleIDErrorKey, profile->bundleIdentifier() },
 					{ UnderlyingErrorCodeErrorKey, std::to_string(statusCode) }
 			};
@@ -1022,7 +1065,7 @@ void DeviceManager::RemoveProvisioningProfile(std::shared_ptr<ProvisioningProfil
 		{
 		case -402620405:
 		{
-			std::map<std::string, std::string> userInfo = {
+			std::map<std::string, std::any> userInfo = {
 				{ ProvisioningProfileBundleIDErrorKey, profile->bundleIdentifier() },
 			};
 
@@ -1036,8 +1079,8 @@ void DeviceManager::RemoveProvisioningProfile(std::shared_ptr<ProvisioningProfil
 
 			std::string localizedFailure = oss.str();
 
-			std::map<std::string, std::string> userInfo = {
-					{ LocalizedFailureErrorKey, localizedFailure },
+			std::map<std::string, std::any> userInfo = {
+					{ NSLocalizedFailureErrorKey, localizedFailure },
 					{ ProvisioningProfileBundleIDErrorKey, profile->bundleIdentifier() },
 					{ UnderlyingErrorCodeErrorKey, std::to_string(statusCode) }
 			};
@@ -1060,8 +1103,8 @@ std::vector<std::shared_ptr<ProvisioningProfile>> DeviceManager::CopyProvisionin
 
 		std::string localizedFailure = "Could not copy provisioning profiles.";
 
-		std::map<std::string, std::string> userInfo = {
-				{ LocalizedFailureErrorKey, localizedFailure },
+		std::map<std::string, std::any> userInfo = {
+				{ NSLocalizedFailureErrorKey, localizedFailure },
 				{ UnderlyingErrorCodeErrorKey, std::to_string(statusCode) }
 		};
 
@@ -1094,6 +1137,8 @@ std::vector<std::shared_ptr<ProvisioningProfile>> DeviceManager::CopyProvisionin
 			data.push_back(bytes[i]);
 		}
 
+		free(bytes);
+
 		auto provisioningProfile = std::make_shared<ProvisioningProfile>(data);
 		provisioningProfiles.push_back(provisioningProfile);
 	}
@@ -1101,6 +1146,412 @@ std::vector<std::shared_ptr<ProvisioningProfile>> DeviceManager::CopyProvisionin
 	plist_free(profiles);
 
 	return provisioningProfiles;
+}
+
+pplx::task<bool> DeviceManager::IsDeveloperDiskImageMounted(std::shared_ptr<Device> altDevice)
+{
+	return pplx::create_task([=]() -> bool {
+		idevice_t device = NULL;
+		instproxy_client_t ipc = NULL;
+		lockdownd_client_t client = NULL;
+		lockdownd_service_descriptor_t service = NULL;
+		mobile_image_mounter_client_t mim = NULL;
+
+		auto cleanUp = [&]() {
+			if (mim) {
+				if (device != NULL && device->conn_type == CONNECTION_USBMUXD)
+				{
+					// For some reason, calling this method over WiFi may freeze AltServer.
+					// Nothing bad *seems* to happen if we don't call it though, so just limit it to wired connections.
+					mobile_image_mounter_hangup(mim);
+				}
+
+				mobile_image_mounter_free(mim);
+			}
+
+			if (service) {
+				lockdownd_service_descriptor_free(service);
+			}
+
+			if (client) {
+				lockdownd_client_free(client);
+			}
+
+			if (ipc) {
+				instproxy_client_free(ipc);
+			}
+
+			if (device) {
+				idevice_free(device);
+			}
+		};
+
+		try
+		{
+			/* Find Device */
+			if (idevice_new_with_options(&device, altDevice->identifier().c_str(), (enum idevice_options)((int)IDEVICE_LOOKUP_NETWORK | (int)IDEVICE_LOOKUP_USBMUX)) != IDEVICE_E_SUCCESS)
+			{
+				throw ServerError(ServerErrorCode::DeviceNotFound);
+			}
+
+			/* Connect to Device */
+			if (lockdownd_client_new_with_handshake(device, &client, "altserver") != LOCKDOWN_E_SUCCESS)
+			{
+				throw ServerError(ServerErrorCode::ConnectionFailed);
+			}
+
+			/* Connect to Mobile Image Mounter Proxy */
+			if ((lockdownd_start_service(client, "com.apple.mobile.mobile_image_mounter", &service) != LOCKDOWN_E_SUCCESS) || service == NULL)
+			{
+				throw ServerError(ServerErrorCode::ConnectionFailed);
+			}
+
+			mobile_image_mounter_error_t err = mobile_image_mounter_new(device, service, &mim);
+			if (err != MOBILE_IMAGE_MOUNTER_E_SUCCESS)
+			{
+				auto error = ConnectionError::errorForMobileImageMounterError(err, altDevice);
+				if (error.has_value())
+				{
+					throw* error;
+				}
+			}
+
+			plist_t result = NULL;
+			err = mobile_image_mounter_lookup_image(mim, "Developer", &result);
+			if (err != MOBILE_IMAGE_MOUNTER_E_SUCCESS)
+			{
+				auto error = ConnectionError::errorForMobileImageMounterError(err, altDevice);
+				if (error.has_value())
+				{
+					throw *error;
+				}
+			}
+
+			bool isMounted = false;
+
+			plist_dict_iter it = NULL;
+			plist_dict_new_iter(result, &it);
+
+			char* key = NULL;
+			plist_t subnode = NULL;
+			plist_dict_next_item(result, it, &key, &subnode);
+
+			while (subnode)
+			{
+				// If the ImageSignature key in the returned plist contains a subentry the disk image is already uploaded.
+				// Hopefully this works for older iOS versions as well.
+				// (via https://github.com/Schlaubischlump/LocationSimulator/blob/fdbd93ad16be5f69111b571d71ed6151e850144b/LocationSimulator/MobileDevice/devicemount/deviceimagemounter.c)
+				plist_type type = plist_get_node_type(subnode);
+				if (strcmp(key, "ImageSignature") == 0 && PLIST_ARRAY == type)
+				{
+					isMounted = (plist_array_get_size(subnode) != 0);
+				}
+
+				free(key);
+				key = NULL;
+
+				if (isMounted)
+				{
+					break;
+				}
+
+				plist_dict_next_item(result, it, &key, &subnode);
+			}
+
+			free(it);
+
+			cleanUp();
+
+			return isMounted;
+		}
+		catch (std::exception& exception)
+		{
+			cleanUp();
+			throw;
+		}
+	});
+}
+
+pplx::task<void> DeviceManager::InstallDeveloperDiskImage(std::string diskPath, std::string signaturePath, std::shared_ptr<Device> altDevice)
+{
+	return pplx::create_task([=]() -> pplx::task<void> {
+		idevice_t device = NULL;
+		instproxy_client_t ipc = NULL;
+		lockdownd_client_t client = NULL;
+		lockdownd_service_descriptor_t service = NULL;
+		mobile_image_mounter_client_t mim = NULL;
+
+		auto cleanUp = [&]() {
+			if (mim) {
+				if (device != NULL && device->conn_type == CONNECTION_USBMUXD)
+				{
+					// For some reason, calling this method over WiFi may freeze AltServer.
+					// Nothing bad *seems* to happen if we don't call it though, so just limit it to wired connections.
+					mobile_image_mounter_hangup(mim);
+				}
+
+				mobile_image_mounter_free(mim);
+			}
+
+			if (service) {
+				lockdownd_service_descriptor_free(service);
+			}
+
+			if (client) {
+				lockdownd_client_free(client);
+			}
+
+			if (ipc) {
+				instproxy_client_free(ipc);
+			}
+
+			if (device) {
+				idevice_free(device);
+			}
+		};
+
+		try
+		{
+			/* Find Device */
+			if (idevice_new_with_options(&device, altDevice->identifier().c_str(), (enum idevice_options)((int)IDEVICE_LOOKUP_NETWORK | (int)IDEVICE_LOOKUP_USBMUX)) != IDEVICE_E_SUCCESS)
+			{
+				throw ServerError(ServerErrorCode::DeviceNotFound);
+			}
+
+			/* Connect to Device */
+			if (lockdownd_client_new_with_handshake(device, &client, "altserver") != LOCKDOWN_E_SUCCESS)
+			{
+				throw ServerError(ServerErrorCode::ConnectionFailed);
+			}
+
+			/* Connect to Mobile Image Mounter Proxy */
+			if ((lockdownd_start_service(client, "com.apple.mobile.mobile_image_mounter", &service) != LOCKDOWN_E_SUCCESS) || service == NULL)
+			{
+				throw ServerError(ServerErrorCode::ConnectionFailed);
+			}
+
+			mobile_image_mounter_error_t err = mobile_image_mounter_new(device, service, &mim);
+			if (err != MOBILE_IMAGE_MOUNTER_E_SUCCESS)
+			{
+				auto error = ConnectionError::errorForMobileImageMounterError(err, altDevice);
+				if (error.has_value())
+				{
+					throw* error;
+				}
+			}
+
+			size_t diskSize = std::filesystem::file_size(diskPath.c_str());
+			auto signature = readFile(signaturePath.c_str());
+
+			FILE* file = fopen(diskPath.c_str(), "rb");
+			err = mobile_image_mounter_upload_image(mim, "Developer", diskSize, (const char*)signature.data(), (size_t)signature.size(), DeviceManagerUploadFile, file);
+			fclose(file);
+
+			if (err != MOBILE_IMAGE_MOUNTER_E_SUCCESS)
+			{
+				auto error = ConnectionError::errorForMobileImageMounterError(err, altDevice);
+				if (error.has_value())
+				{
+					throw* error;
+				}
+			}
+
+			std::string destinationDiskPath = "/private/var/mobile/Media/PublicStaging/staging.dimage";
+
+			plist_t result = NULL;
+			err = mobile_image_mounter_mount_image(mim, destinationDiskPath.c_str(), (const char*)signature.data(), (size_t)signature.size(), "Developer", &result);
+			if (err != MOBILE_IMAGE_MOUNTER_E_SUCCESS)
+			{
+				auto error = ConnectionError::errorForMobileImageMounterError(err, altDevice);
+				if (error.has_value())
+				{
+					throw* error;
+				}
+			}
+
+			plist_t errorDescriptionNode = plist_dict_get_item(result, "DetailedError");
+			if (errorDescriptionNode != nullptr)
+			{
+				char* rawErrorDescription = nullptr;
+				plist_get_string_val(errorDescriptionNode, &rawErrorDescription);
+
+				std::string errorDescription = rawErrorDescription;
+				plist_free(result);
+
+				if (errorDescription.find("Failed to verify") != std::string::npos)
+				{
+					// iOS device needs to be rebooted in order to mount disk to /Developer.
+					auto recoverySuggestion = "Please reboot " + altDevice->name() + " and try again.";
+
+					// Provide recoverySuggestion as NSLocalizedFailureReasonErrorKey 
+					// to make sure it's always displayed on client.
+					std::map<std::string, std::any> userInfo = {
+						{ UnderlyingErrorDomainErrorKey, ConnectionErrorDomain },
+						{ UnderlyingErrorCodeErrorKey, std::to_string((int)ConnectionErrorCode::Unknown) },
+						{ NSLocalizedFailureReasonErrorKey, recoverySuggestion}
+					};
+
+					throw ServerError(ServerErrorCode::UnderlyingError, userInfo);
+				}
+				else
+				{
+					// Installation failed, so we assume the developer disk is NOT compatible with this iOS version.
+					std::shared_ptr<Error> underlyingError(new LocalizedInstallationError((int)ConnectionErrorCode::Unknown, errorDescription));
+
+					std::map<std::string, std::any> userInfo = {
+						{ OperatingSystemVersionErrorKey, altDevice->osVersion().stringValue() },
+						{ NSFilePathErrorKey, diskPath },
+						{ NSUnderlyingErrorKey, underlyingError }
+					};
+
+					auto osName = ALTOperatingSystemNameForDeviceType(altDevice->type());
+					if (osName.has_value())
+					{
+						userInfo[OperatingSystemNameErrorKey] = *osName;
+					}
+
+					auto localizedFailureReason = ServerError(ServerErrorCode::IncompatibleDeveloperDisk, userInfo).localizedFailureReason();
+					if (localizedFailureReason.has_value())
+					{
+						// WORKAROUND: AltKit 0.0.2 crashes when receiving IncompatibleDeveloperDisk
+						// error code unless we explicitly provide localized failure reason.
+						userInfo[NSLocalizedFailureReasonErrorKey] = *localizedFailureReason;
+					}
+
+					throw ServerError(ServerErrorCode::IncompatibleDeveloperDisk, userInfo);
+				}
+			}
+
+			plist_free(result);
+
+			// Must clean up from same thread we created objects on.
+			cleanUp();
+
+			// Verify the developer disk has been successfully installed.
+			auto testConnection = std::make_shared<DebugConnection>(altDevice);
+			return testConnection->Connect().then([testConnection, altDevice](pplx::task<void> task) {
+				testConnection->Disconnect();
+				task.get();
+			});
+		}
+		catch (std::exception& exception)
+		{
+			cleanUp();
+			throw;
+		}
+	})
+	.then([altDevice](pplx::task<void> task) {
+		try
+		{
+			task.get();
+		}
+		catch (Error& error)
+		{
+			std::string localizedFailure("The Developer disk image couldn't be installed to " + altDevice->name() + ".");
+			error.setLocalizedFailure(localizedFailure);
+
+			throw;
+		}
+	});
+}
+
+pplx::task<std::vector<InstalledApp>> DeviceManager::FetchInstalledApps(std::shared_ptr<Device> altDevice)
+{
+	return pplx::create_task([=] {
+		idevice_t device = NULL;
+		instproxy_client_t ipc = NULL;
+		lockdownd_client_t client = NULL;
+		lockdownd_service_descriptor_t service = NULL;
+		plist_t options = NULL;
+
+		auto cleanUp = [&]() {
+			if (options) {
+				instproxy_client_options_free(options);
+			}
+
+			if (service) {
+				lockdownd_service_descriptor_free(service);
+			}
+
+			if (client) {
+				lockdownd_client_free(client);
+			}
+
+			if (ipc) {
+				instproxy_client_free(ipc);
+			}
+
+			if (device) {
+				idevice_free(device);
+			}
+		};
+
+		/* Find Device */
+		if (idevice_new_with_options(&device, altDevice->identifier().c_str(), (enum idevice_options)((int)IDEVICE_LOOKUP_NETWORK | (int)IDEVICE_LOOKUP_USBMUX)) != IDEVICE_E_SUCCESS)
+		{
+			throw ServerError(ServerErrorCode::DeviceNotFound);
+		}
+
+		/* Connect to Device */
+		if (lockdownd_client_new_with_handshake(device, &client, "AltServer") != LOCKDOWN_E_SUCCESS)
+		{
+			throw ServerError(ServerErrorCode::ConnectionFailed);
+		}
+
+		/* Connect to Installation Proxy */
+		if ((lockdownd_start_service(client, "com.apple.mobile.installation_proxy", &service) != LOCKDOWN_E_SUCCESS) || service == NULL)
+		{
+			throw ServerError(ServerErrorCode::ConnectionFailed);
+		}
+
+		instproxy_error_t err = instproxy_client_new(device, service, &ipc);
+		if (err != INSTPROXY_E_SUCCESS)
+		{
+			auto error = ConnectionError::errorForInstallationProxyError(err, altDevice);
+			if (error.has_value())
+			{
+				throw* error;
+			}
+		}
+
+		options = instproxy_client_options_new();
+		instproxy_client_options_add(options, "ApplicationType", "User", NULL);
+
+		plist_t plist = NULL;
+		err = instproxy_browse(ipc, options, &plist);
+		if (err != INSTPROXY_E_SUCCESS)
+		{
+			auto error = ConnectionError::errorForInstallationProxyError(err, altDevice);
+			if (error.has_value())
+			{
+				throw* error;
+			}
+		}
+
+		std::vector<InstalledApp> installedApps;
+
+		for (int i = 0; i < plist_array_get_size(plist); i++)
+		{
+			auto appPlist = plist_array_get_item(plist, i);
+			if (plist_dict_get_item(appPlist, "ALTBundleIdentifier") == NULL)
+			{
+				continue;
+			}
+
+			try {
+				InstalledApp installedApp(appPlist);
+				installedApps.push_back(installedApp);
+			}
+			catch (std::exception& e)
+			{
+				// Ignore exception
+			}
+		}
+
+		plist_free(plist);
+
+		return installedApps;
+	});
 }
 
 pplx::task<std::shared_ptr<NotificationConnection>> DeviceManager::StartNotificationConnection(std::shared_ptr<Device> altDevice)
@@ -1112,7 +1563,7 @@ pplx::task<std::shared_ptr<NotificationConnection>> DeviceManager::StartNotifica
 		np_client_t client = NULL;
 
 		/* Find Device */
-		if (idevice_new_ignore_network(&device, altDevice->identifier().c_str()) != IDEVICE_E_SUCCESS)
+		if (idevice_new_with_options(&device, altDevice->identifier().c_str(), IDEVICE_LOOKUP_USBMUX) != IDEVICE_E_SUCCESS)
 		{
 			throw ServerError(ServerErrorCode::DeviceNotFound);
 		}
@@ -1167,123 +1618,162 @@ std::vector<std::shared_ptr<Device>> DeviceManager::availableDevices() const
 std::vector<std::shared_ptr<Device>> DeviceManager::availableDevices(bool includeNetworkDevices) const
 {
     std::vector<std::shared_ptr<Device>> availableDevices;
-    
+
     int count = 0;
-    char **udids = NULL;
-    if (idevice_get_device_list(&udids, &count) < 0)
+
+    idevice_info_t* devices = NULL;
+    if (idevice_get_device_list_extended(&devices, &count) < 0)
     {
         fprintf(stderr, "ERROR: Unable to retrieve device list!\n");
         return availableDevices;
     }
-    
+
     for (int i = 0; i < count; i++)
     {
-        char *udid = udids[i];
-        
+        idevice_info_t device_info = devices[i];
+        char* udid = device_info->udid;
+
         idevice_t device = NULL;
-        
+        lockdownd_client_t client = NULL;
+
+        char* device_name = NULL;
+        char* device_type_string = NULL;
+        char* device_version_string = NULL;
+
+        plist_t device_type_plist = NULL;
+        plist_t device_version_plist = NULL;
+
+        auto cleanUp = [&]() {
+            if (device_version_plist) {
+                plist_free(device_version_plist);
+            }
+
+            if (device_type_plist) {
+                plist_free(device_type_plist);
+            }
+
+            if (device_version_string) {
+                free(device_version_string);
+            }
+
+            if (device_type_string) {
+                free(device_type_string);
+            }
+
+            if (device_name) {
+                free(device_name);
+            }
+
+            if (client) {
+                lockdownd_client_free(client);
+            }
+
+            if (device) {
+                idevice_free(device);
+            }
+        };
+
         if (includeNetworkDevices)
         {
-            idevice_new(&device, udid);
+            idevice_new_with_options(&device, udid, (enum idevice_options)((int)IDEVICE_LOOKUP_NETWORK | (int)IDEVICE_LOOKUP_USBMUX));
         }
         else
         {
-            idevice_new_ignore_network(&device, udid);
+            idevice_new_with_options(&device, udid, IDEVICE_LOOKUP_USBMUX);
         }
-        
+
         if (!device)
         {
             continue;
         }
-        
-        lockdownd_client_t client = NULL;
+
         int result = lockdownd_client_new(device, &client, "altserver");
         if (result != LOCKDOWN_E_SUCCESS)
         {
             fprintf(stderr, "ERROR: Connecting to device %s failed! (%d)\n", udid, result);
-            
-            idevice_free(device);
-            
+
+            cleanUp();
             continue;
         }
-        
-        char *device_name = NULL;
+
         if (lockdownd_get_device_name(client, &device_name) != LOCKDOWN_E_SUCCESS || device_name == NULL)
         {
             fprintf(stderr, "ERROR: Could not get device name!\n");
-            
-            lockdownd_client_free(client);
-            idevice_free(device);
-            
+
+            cleanUp();
             continue;
         }
 
-		plist_t device_type_plist = NULL;
-		if (lockdownd_get_value(client, NULL, "ProductType", &device_type_plist) != LOCKDOWN_E_SUCCESS)
-		{
-			odslog("ERROR: Could not get device type for " << device_name);
-
-			lockdownd_client_free(client);
-			idevice_free(device);
-
-			continue;
-		}
-
-		Device::Type deviceType = Device::Type::iPhone;
-
-		char* device_type_string = NULL;
-		plist_get_string_val(device_type_plist, &device_type_string);
-
-		if (std::string(device_type_string).find("iPhone") != std::string::npos ||
-			std::string(device_type_string).find("iPod") != std::string::npos)
-		{
-			deviceType = Device::Type::iPhone;
-		}
-		else if (std::string(device_type_string).find("iPad") != std::string::npos)
-		{
-			deviceType = Device::Type::iPad;
-		}
-		else if (std::string(device_type_string).find("AppleTV") != std::string::npos)
-		{
-			deviceType = Device::Type::AppleTV;
-		}
-		else
-		{
-			odslog("Unknown device type " << device_type_string << " for " << device_name);
-			deviceType = Device::Type::None;
-		}
-        
-        lockdownd_client_free(client);
-        idevice_free(device);
-
-		bool isDuplicate = false;
-
-		for (auto& device : availableDevices)
-		{
-			if (device->identifier() == udid)
-			{
-				// Duplicate.
-				isDuplicate = true;
-				break;
-			}
-		}
-
-		if (isDuplicate)
-		{
-			continue;
-		}
-        
-		auto altDevice = std::make_shared<Device>(device_name, udid, deviceType);
-        availableDevices.push_back(altDevice);
-        
-        if (device_name != NULL)
+        if (lockdownd_get_value(client, NULL, "ProductType", &device_type_plist) != LOCKDOWN_E_SUCCESS)
         {
-            free(device_name);
+            odslog("ERROR: Could not get device type for " << device_name);
+
+            cleanUp();
+            continue;
         }
+
+        plist_get_string_val(device_type_plist, &device_type_string);
+
+        Device::Type deviceType = Device::Type::iPhone;
+        if (std::string(device_type_string).find("iPhone") != std::string::npos ||
+            std::string(device_type_string).find("iPod") != std::string::npos)
+        {
+            deviceType = Device::Type::iPhone;
+        }
+        else if (std::string(device_type_string).find("iPad") != std::string::npos)
+        {
+            deviceType = Device::Type::iPad;
+        }
+        else if (std::string(device_type_string).find("AppleTV") != std::string::npos)
+        {
+            deviceType = Device::Type::AppleTV;
+        }
+        else
+        {
+            odslog("Unknown device type " << device_type_string << " for " << device_name);
+
+            cleanUp();
+            continue;
+        }
+
+        if (lockdownd_get_value(client, NULL, "ProductVersion", &device_version_plist) != LOCKDOWN_E_SUCCESS)
+        {
+            odslog("ERROR: Could not get device type for " << device_name);
+
+            cleanUp();
+            continue;
+        }
+
+        plist_get_string_val(device_version_plist, &device_version_string);
+        OperatingSystemVersion osVersion(device_version_string);
+
+        bool isDuplicate = false;
+
+        for (auto& device : availableDevices)
+        {
+            if (device->identifier() == udid)
+            {
+                // Duplicate.
+                isDuplicate = true;
+                break;
+            }
+        }
+
+        if (isDuplicate)
+        {
+            cleanUp();
+            continue;
+        }
+
+        auto altDevice = std::make_shared<Device>(device_name, udid, deviceType);
+        altDevice->setOSVersion(osVersion);
+        availableDevices.push_back(altDevice);
+
+        cleanUp();
     }
-    
-    idevice_device_list_free(udids);
-    
+
+    idevice_device_list_extended_free(devices);
+
     return availableDevices;
 }
 
@@ -1435,4 +1925,9 @@ void DeviceDidChangeConnectionStatus(const idevice_event_t* event, void* user_da
 		break;
 	}
 	}
+}
+
+ssize_t DeviceManagerUploadFile(void* buffer, size_t size, void* user_data)
+{
+	return fread(buffer, 1, size, (FILE*)user_data);
 }

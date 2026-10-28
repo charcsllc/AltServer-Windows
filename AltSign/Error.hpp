@@ -9,9 +9,33 @@
 #ifndef Error_hpp
 #define Error_hpp
 
+#include <cpprest/json.h>
+
 #include <iostream>
 #include <exception>
 #include <map>
+#include <optional>
+#include <string>
+#include <any>
+
+#include <assert.h>
+
+#define __FILENAME__ (strrchr(__FILE__, '\\') ? strrchr(__FILE__, '\\') + 1 : __FILE__)
+#define SOURCE_USERINFO { {"Source File", __FILENAME__}, {"Source Line", __LINE__} }
+
+extern std::string NSLocalizedDescriptionKey;
+extern std::string NSLocalizedFailureErrorKey;
+extern std::string NSLocalizedFailureReasonErrorKey;
+extern std::string NSLocalizedRecoverySuggestionErrorKey;
+extern std::string NSUnderlyingErrorKey;
+extern std::string NSDebugDescriptionErrorKey;
+
+extern std::string ALTLocalizedDescriptionKey;
+extern std::string ALTLocalizedFailureReasonErrorKey;
+extern std::string ALTLocalizedRecoverySuggestionErrorKey;
+extern std::string ALTDebugDescriptionErrorKey;
+
+extern std::string AnyStringValue(std::any& any);
 
 enum class SignErrorCode
 {
@@ -27,7 +51,7 @@ enum class SignErrorCode
 
 enum class APIErrorCode
 {
-    Unknown,
+    Unknown = 3000,
     InvalidParameters,
     
     IncorrectCredentials,
@@ -60,85 +84,174 @@ enum class APIErrorCode
 	InvalidAnisetteData,
 };
 
-enum class ArchiveErrorCode
+enum class CocoaErrorCode
 {
-    Unknown,
-    UnknownWrite,
-    NoSuchFile,
-    CorruptFile,
+    FileNoSuchFile = 4,
+
+    FileReadUnknown = 256,
+    FileReadCorruptFile = 259,
+
+    FileWriteUnknown = 512,
+
+    CoderReadCorrupt = 4864,
+    CoderValueNotFound = 4865,
 };
 
 class Error: public std::exception
 {
 public:
-    Error(int code) : _code(code), _userInfo(std::map<std::string, std::string>())
+    Error(int code, std::map<std::string, std::any> userInfo = {}) : _code(code), _userInfo(userInfo)
     {
+        if (_userInfo.count(NSUnderlyingErrorKey) == 0)
+        {
+            return;
+        }
+            
+        try
+        {
+            auto value = _userInfo[NSUnderlyingErrorKey];
+            std::shared_ptr<Error> underlyingError = std::any_cast<std::shared_ptr<Error>>(value);
+        }
+        catch (std::bad_any_cast)
+        {
+            // All underlying errors MUST be std::shared_ptrs in order to retrieve them from user info.
+            assert(false);
+        }
     }
 
-	Error(int code, std::map<std::string, std::string> userInfo) : _code(code), _userInfo(userInfo)
-	{
-	}
-    
-    virtual std::string localizedDescription() const
-    {
-        return "";
-    }
-    
+    virtual std::string domain() const = 0;
+
     int code() const
     {
         return _code;
     }
 
-	std::map<std::string, std::string> userInfo() const
-	{
-		return _userInfo;
-	}
-    
-    virtual std::string domain() const
+    std::map<std::string, std::any> userInfo() const
     {
-        return "com.rileytestut.AltServer.Error";
+        return _userInfo;
     }
-    
+
+    std::string localizedDescription() const
+    {
+        std::string localizedDescription;
+
+        if (this->_userInfo.count(NSLocalizedDescriptionKey) > 0)
+        {
+            localizedDescription = AnyStringValue(this->userInfo().at(NSLocalizedDescriptionKey));
+        }
+        else if (this->localizedFailure().has_value())
+        {
+            auto localizedFailure = *this->localizedFailure();
+
+            if (this->localizedFailureReason().has_value())
+            {
+                auto localizedFailureReason = *this->localizedFailureReason();
+                localizedDescription = localizedFailure + " " + localizedFailureReason;
+            }
+            else
+            {
+                localizedDescription = localizedFailure;
+            }
+        }
+        else if (this->localizedFailureReason().has_value())
+        {
+            localizedDescription = *this->localizedFailureReason();
+        }
+        else
+        {
+            localizedDescription = this->localizedErrorCode();
+        }
+
+        return localizedDescription;
+    }
+
+    std::optional<std::string> localizedFailure() const
+    {
+        if (this->_userInfo.count(NSLocalizedFailureErrorKey) > 0)
+        {
+            auto localizedFailure = AnyStringValue(this->userInfo().at(NSLocalizedFailureErrorKey));
+            return localizedFailure;
+        }
+
+        return std::nullopt;
+    }
+
+    void setLocalizedFailure(std::optional<std::string> localizedFailure)
+    {
+        this->_userInfo[NSLocalizedFailureErrorKey] = localizedFailure;
+    }
+
+    virtual std::optional<std::string> localizedFailureReason() const
+    {
+        if (this->_userInfo.count(NSLocalizedFailureReasonErrorKey) > 0)
+        {
+            auto localizedFailureReason = AnyStringValue(this->userInfo().at(NSLocalizedFailureReasonErrorKey));
+            return localizedFailureReason;
+        }
+
+        return std::nullopt;
+    }
+
+    virtual std::optional<std::string> localizedRecoverySuggestion() const
+    {
+        if (this->_userInfo.count(NSLocalizedRecoverySuggestionErrorKey) > 0)
+        {
+            auto localizedRecoverySuggestion = AnyStringValue(this->userInfo().at(NSLocalizedRecoverySuggestionErrorKey));
+            return localizedRecoverySuggestion;
+        }
+
+        return std::nullopt;
+    }
+
+    virtual std::optional<std::string> localizedDebugDescription() const
+    {
+        if (this->_userInfo.count(NSDebugDescriptionErrorKey) > 0)
+        {
+            auto debugDescription = AnyStringValue(this->userInfo().at(NSDebugDescriptionErrorKey));
+            return debugDescription;
+        }
+
+        return std::nullopt;
+    }
+
+    std::string localizedErrorCode() const
+    {
+        auto localizedErrorCode = this->domain() + " " + std::to_string(this->displayCode());
+        return localizedErrorCode;
+    }
+
+    virtual int displayCode() const
+    {
+        return this->code();
+    }
+
     friend std::ostream& operator<<(std::ostream& os, const Error& error)
     {
-        os << "Error: (" << error.domain() << "): " << error.localizedDescription() << " (" << error.code() << ")";
+        os << error.localizedErrorCode() << ". \"" << error.localizedDescription() << "\"";
         return os;
     }
-    
-private:
-    int _code;
-	std::map<std::string, std::string> _userInfo;
-};
 
-class LocalizedError: public Error
-{
-public:
-    LocalizedError(int code, std::string localizedDescription) : Error(code), _localizedDescription(localizedDescription)
-    {
-    }
+    web::json::value serialized() const;
+    std::string formattedDetailedDescription() const;
     
-    virtual std::string localizedDescription() const
-    {
-        return _localizedDescription;
-    }
-    
-private:
-    std::string _localizedDescription;
+protected:
+    int _code;
+	std::map<std::string, std::any> _userInfo;
 };
 
 class APIError : public Error
 {
 public:
-    APIError(APIErrorCode code) : Error((int)code)
+    APIError(APIErrorCode code, std::map<std::string, std::any> userInfo = {}) : Error((int)code, userInfo)
     {
     }
     
     virtual std::string domain() const
     {
-        return "com.rileytestut.ALTAppleAPI";
+        return "AltStore.AppleDeveloperError";
     }
     
-    virtual std::string localizedDescription() const
+    virtual std::optional<std::string> localizedFailureReason() const
     {
         switch ((APIErrorCode)this->code())
         {
@@ -222,10 +335,10 @@ public:
     
     virtual std::string domain() const
     {
-        return "com.rileytestut.AltSign";
+        return "AltSign.Error";
     }
     
-    virtual std::string localizedDescription() const
+    virtual std::optional<std::string> localizedFailureReason() const
     {
         switch ((SignErrorCode)this->code())
         {
@@ -258,36 +371,83 @@ public:
     }
 };
 
-class ArchiveError: public Error
+class CocoaError: public Error
 {
 public:
-    ArchiveError(ArchiveErrorCode code) : Error((int)code)
+    CocoaError(CocoaErrorCode code, std::map<std::string, std::any> userInfo = {}) : Error((int)code, userInfo)
     {
     }
     
     virtual std::string domain() const
     {
-        return "com.rileytestut.Archive";
+        return "NSCocoaErrorDomain";
     }
     
-    virtual std::string localizedDescription() const
+    virtual std::optional<std::string> localizedFailureReason() const
     {
-        switch ((ArchiveErrorCode)this->code())
+        switch ((CocoaErrorCode)this->code())
         {
-            case ArchiveErrorCode::Unknown:
-                return "An unknown error occured.";
+            case CocoaErrorCode::FileReadUnknown:
+                return "An unknown error occured while reading the file.";
 
-            case ArchiveErrorCode::UnknownWrite:
+            case CocoaErrorCode::FileWriteUnknown:
                 return "An unknown error occured while writing to disk.";
 
-			case ArchiveErrorCode::NoSuchFile:
+			case CocoaErrorCode::FileNoSuchFile:
                 return "The app could not be found.";
 
-            case ArchiveErrorCode::CorruptFile:
-                return "The app is corrupted.";
+            case CocoaErrorCode::FileReadCorruptFile:
+                return "The app isn't in the correct format.";
+
+            case CocoaErrorCode::CoderReadCorrupt:
+                return "The data isn't in the correct format.";
+
+            case CocoaErrorCode::CoderValueNotFound:
+                return "The data is missing.";
         }
 
 		return "Unknown error.";
+    }
+};
+
+class LocalizedError : public Error
+{
+public:
+    LocalizedError(int code, std::string localizedDescription) : Error(code, { {NSLocalizedDescriptionKey, localizedDescription} })
+    {
+    }
+
+    using Error::Error;
+
+    virtual std::optional<std::string> localizedFailureReason() const
+    {
+        return std::nullopt;
+    }
+};
+
+class LocalizedAPIError : public LocalizedError
+{
+public:
+    virtual std::string domain() const { return "Apple.APIError"; }
+
+    using LocalizedError::LocalizedError; // Inherit constructor
+};
+
+class LocalizedInstallationError : public LocalizedError
+{
+public:
+    virtual std::string domain() const { return "Apple.InstallationError"; }
+
+    using LocalizedError::LocalizedError; // Inherit constructor
+};
+
+class ExceptionError : public LocalizedError
+{
+public:
+    virtual std::string domain() const { return "AltServer.ExceptionError"; }
+
+    ExceptionError(std::exception& exception) : LocalizedError(0, exception.what())
+    {
     }
 };
 

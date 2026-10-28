@@ -9,13 +9,14 @@
 #include "DeviceManager.hpp"
 #include "AnisetteDataManager.h"
 #include "AnisetteData.h"
+#include "AltServerApp.h"
 
 #include "ServerError.hpp"
+#include "ConnectionError.hpp"
+#include "WindowsError.h"
+#include "AltInclude.h"
 
 #define odslog(msg) { std::stringstream ss; ss << msg << std::endl; OutputDebugStringA(ss.str().c_str()); }
-
-extern std::string make_uuid();
-extern std::string temporary_directory();
 
 using namespace web;
 
@@ -23,17 +24,17 @@ namespace fs = std::filesystem;
 
 std::string StringFromWideString(std::wstring wideString)
 {
-	std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
-
-	std::string string = converter.to_bytes(wideString);
+	int count = WideCharToMultiByte(CP_UTF8, 0, wideString.c_str(), wideString.length(), NULL, 0, NULL, NULL);
+	std::string string(count, 0);
+	WideCharToMultiByte(CP_UTF8, 0, wideString.c_str(), -1, &string[0], count, NULL, NULL);
 	return string;
 }
 
 std::wstring WideStringFromString(std::string string)
 {
-	std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
-
-	std::wstring wideString = converter.from_bytes(string);
+	int count = MultiByteToWideChar(CP_UTF8, 0, string.c_str(), string.length(), NULL, 0);
+	std::wstring wideString(count, 0);
+	MultiByteToWideChar(CP_UTF8, 0, string.c_str(), string.length(), &wideString[0], count);
 	return wideString;
 }
 
@@ -75,6 +76,10 @@ pplx::task<void> ClientConnection::ProcessAppRequest()
 		{
 			return this->ProcessRemoveAppRequest(request);
 		}
+        else if (identifier == "EnableUnsignedCodeExecutionRequest")
+        {
+            return this->ProcessEnableUnsignedCodeExecutionRequest(request);
+        }
 		else
 		{
 			throw ServerError(ServerErrorCode::UnknownRequest);
@@ -87,7 +92,20 @@ pplx::task<void> ClientConnection::ProcessAppRequest()
 		catch (std::exception& e)
 		{
 			auto errorResponse = this->ErrorResponse(e);
-			this->SendResponse(errorResponse);
+			this->SendResponse(errorResponse).then([=](pplx::task<void> task) {
+				try
+				{
+					task.get();
+				}
+				catch (Error& error)
+				{
+					odslog("[ALTLog] Failed to send error response: " << error.localizedDescription());
+				}
+				catch (std::exception& exception)
+				{
+					odslog("[ALTLog] Failed to send error response: " << exception.what());
+				}
+			});
 
 			throw;
 		}		
@@ -208,21 +226,35 @@ pplx::task<void> ClientConnection::InstallApp(std::string filepath, std::string 
 				response[L"progress"] = json::value::number(progress);
 
 				this->SendResponse(response).then([isSending](pplx::task<void> task) {
-					*isSending = false;
-					});
+					try
+					{
+						task.get();
+
+						// Only set to false if there wasn't an error sending progress.
+						*isSending = false;
+					}
+					catch (Error& error)
+					{
+						odslog("[ALTLog] Error sending installation progress: " << error.localizedDescription());
+					}
+					catch (std::exception &exception)
+					{
+						odslog("[ALTLog] Error sending installation progress: " << exception.what());
+					}					
 				});
+			});
 		}
 		catch (Error& error)
 		{
 			std::cout << error << std::endl;
 
-			throw error;
+			throw;
 		}
 		catch (std::exception& e)
 		{
 			std::cout << "Exception: " << e.what() << std::endl;
 
-			throw e;
+			throw;
 		}
 		std::cout << "Installed app!" << std::endl;
 	});
@@ -332,63 +364,145 @@ pplx::task<void> ClientConnection::ProcessRemoveAppRequest(web::json::value requ
 	});
 }
 
+pplx::task<void> ClientConnection::ProcessEnableUnsignedCodeExecutionRequest(web::json::value request)
+{
+    return pplx::create_task([this, request]() {
+
+        auto udid = StringFromWideString(request.at(L"udid").as_string());
+
+        std::shared_ptr<Device> device = NULL;
+        for (auto& d : DeviceManager::instance()->availableDevices())
+        {
+            if (d->identifier() == udid)
+            {
+                device = d;
+                break;
+            }
+        }
+
+        if (device == NULL)
+        {
+            throw ServerError(ServerErrorCode::DeviceNotFound);
+        }
+
+        return AltServerApp::instance()->PrepareDevice(device)
+        .then([request, device](void) {
+            return DeviceManager::instance()->StartDebugConnection(device);
+        })
+        .then([request, device](std::shared_ptr<DebugConnection> connection) {
+
+            if (request.has_integer_field(L"processID"))
+            {
+                auto pid = request.at(L"processID").as_integer();
+                return connection->EnableUnsignedCodeExecution(pid).then([connection](void) {
+                    connection->Disconnect();
+                });
+            }
+            else
+            {
+                auto processName = StringFromWideString(request.at(L"processName").as_string());
+                return connection->EnableUnsignedCodeExecution(processName).then([connection](void) {
+                    connection->Disconnect();
+                });
+            }            
+        });
+    })
+    .then([=](pplx::task<void> task) {
+        try
+        {
+            task.get();
+
+            auto response = json::value::object();
+            response[L"version"] = json::value::number(1);
+            response[L"identifier"] = json::value::string(L"EnableUnsignedCodeExecutionResponse");
+            return this->SendResponse(response);
+        }
+        catch (std::exception& exception)
+        {
+            throw;
+        }
+    });
+}
+
 web::json::value ClientConnection::ErrorResponse(std::exception& exception)
 {
 	auto response = json::value::object();
-	response[L"version"] = json::value::number(2);
+	response[L"version"] = json::value::number(3);
 	response[L"identifier"] = json::value::string(L"ErrorResponse");
-
-	auto errorObject = json::value::object();
 
 	try
 	{
-		Error& error = dynamic_cast<Error&>(exception);
+        try 
+        {
+            ServerError& error = dynamic_cast<ServerError&>(exception);
+            auto errorObject = error.serialized();
 
-		response[L"errorCode"] = json::value::number(error.code());
-		errorObject[L"errorCode"] = json::value::number(error.code());
+            response[L"errorCode"] = json::value::number(error.code());
+            response[L"serverError"] = errorObject;
+        }
+        catch (std::bad_cast)
+        {
+            Error& error = dynamic_cast<Error&>(exception);
+            auto underlyingErrorObject = error.serialized();
 
-		if (!error.userInfo().empty())
-		{
-			auto userInfo = json::value::object();
-
-			for (auto& pair : error.userInfo())
+			ServerErrorCode errorCode = ServerErrorCode::UnderlyingError;
+			if (error.domain() == ConnectionError(ConnectionErrorCode::Unknown).domain())
 			{
-				userInfo[WideStringFromString(pair.first)] = json::value(WideStringFromString(pair.second));
+				// Wrap all ConnectionErrors under ServerErrorCode::ConnectionFailed.
+				errorCode = ServerErrorCode::ConnectionFailed;
+			}
+			else if (error.domain() == APIError(APIErrorCode::Unknown).domain() && error.code() == (int)APIErrorCode::InvalidAnisetteData)
+			{
+				// Wrap APIError::InvalidAnisetteData under ServerErrorCode::InvalidAnisetteData.
+				errorCode = ServerErrorCode::InvalidAnisetteData;
 			}
 
-			errorObject[L"userInfo"] = userInfo;
-		}
+			// Can't initialize ServerError with underlying error directly because it is a reference.
+			// As a workaround, we serialize the underlying error separately then manually add it to JSON response.
+			// auto serverError = ServerError(errorCode, { {NSUnderlyingErrorKey, error} });
+
+			auto serverError = ServerError(errorCode);
+			auto errorObject = serverError.serialized();
+			errorObject[L"errorUserInfo"][WideStringFromString(NSUnderlyingErrorKey)] = underlyingErrorObject;
+
+            response[L"errorCode"] = json::value::number(serverError.code());
+            response[L"serverError"] = errorObject;
+        }
 	}
 	catch (std::bad_cast)
 	{
-		response[L"errorCode"] = json::value::number((int)ServerErrorCode::Unknown);
-		errorObject[L"errorCode"] = json::value::number((int)ServerErrorCode::Unknown);
+		web::json::value underlyingErrorObject;
 
-		auto userInfo = json::value::object();
-
-		if (std::string(exception.what()) == "vector<T> too long")
+		if (std::string(exception.what()) == std::string("vector<T> too long"))
 		{
-			userInfo[L"NSLocalizedFailureReason"] = json::value::string(L"Windows Defender Blocked Installation");
-			userInfo[L"NSLocalizedRecoverySuggestion"] = json::value::string(L"Disable Windows real-time protection on your computer then try again.");
+			std::shared_ptr<Error> underlyingError(new ExceptionError(exception));
+
+			auto error = WindowsError(WindowsErrorCode::WindowsDefenderBlockedCommunication, { {NSUnderlyingErrorKey, underlyingError } });
+			underlyingErrorObject = error.serialized();
 		}
 		else
 		{
-			userInfo[L"NSLocalizedDescription"] = json::value::string(WideStringFromString(exception.what()));
-			userInfo[L"NSLocalizedFailureReason"] = json::value::string(WideStringFromString(exception.what()));
+			ExceptionError error(exception);
+			underlyingErrorObject = error.serialized();
 		}
-		
-		errorObject[L"userInfo"] = userInfo;
-	}
 
-	response[L"serverError"] = errorObject;
+		auto serverError = ServerError(ServerErrorCode::UnderlyingError);
+		auto errorObject = serverError.serialized();
+		errorObject[L"errorUserInfo"][WideStringFromString(NSUnderlyingErrorKey)] = underlyingErrorObject;
+
+		response[L"errorCode"] = json::value::number(serverError.code());
+		response[L"serverError"] = errorObject;
+	}
 
 	return response;
 }
 
 pplx::task<void> ClientConnection::SendResponse(web::json::value json)
 {
-	auto serializedJSON = json.serialize();
-	std::vector<unsigned char> responseData(serializedJSON.begin(), serializedJSON.end());
+	auto utf16JSON = json.serialize();
+	auto utf8JSON = ToUTF8(utf16JSON); // Must convert back to UTF-8 to prevent decoding errors!
+
+	std::vector<unsigned char> responseData(utf8JSON.begin(), utf8JSON.end());
 
 	int32_t size = (int32_t)responseData.size();
 
@@ -415,10 +529,12 @@ pplx::task<void> ClientConnection::SendResponse(web::json::value json)
 		catch (Error& error)
 		{
 			odslog("Failed to send response. " << error.localizedDescription());
+			throw;
 		}
 		catch (std::exception& exception)
 		{
 			odslog("Failed to send response. " << exception.what());
+			throw;
 		}
 	});
 

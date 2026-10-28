@@ -23,6 +23,9 @@
 
 #include "WiredConnection.h"
 #include "NotificationConnection.h"
+#include "DebugConnection.h"
+
+#include "InstalledApp.h"
 
 class DeviceManager
 {
@@ -41,6 +44,7 @@ public:
 
 	pplx::task<std::shared_ptr<WiredConnection>> StartWiredConnection(std::shared_ptr<Device> device);
 	pplx::task<std::shared_ptr<NotificationConnection>> StartNotificationConnection(std::shared_ptr<Device> device);
+	pplx::task<std::shared_ptr<DebugConnection>> StartDebugConnection(std::shared_ptr<Device> device);
 
 	pplx::task<void> InstallProvisioningProfiles(std::vector<std::shared_ptr<ProvisioningProfile>> profiles, std::string deviceUDID, std::optional<std::set<std::string>> activeProfiles);
 	pplx::task<void> RemoveProvisioningProfiles(std::set<std::string> bundleIdentifiers, std::string deviceUDID);
@@ -48,6 +52,13 @@ public:
 	std::map<std::string, std::shared_ptr<ProvisioningProfile>> RemoveProvisioningProfiles(std::set<std::string> bundleIdentifiers, misagent_client_t misagent);
 	std::map<std::string, std::shared_ptr<ProvisioningProfile>> RemoveAllFreeProvisioningProfilesExcludingBundleIdentifiers(std::set<std::string> excludedBundleIdentifiers, misagent_client_t misagent);
 	std::map<std::string, std::shared_ptr<ProvisioningProfile>> RemoveAllProvisioningProfiles(std::optional<std::set<std::string>> includedBundleIdentifiers, std::optional<std::set<std::string>> excludedBundleIdentifiers, bool limitedToFreeProfiles, misagent_client_t misagent);
+
+	/* Developer Disk Image */
+	pplx::task<bool> IsDeveloperDiskImageMounted(std::shared_ptr<Device> device);
+	pplx::task<void> InstallDeveloperDiskImage(std::string diskPath, std::string signaturePath, std::shared_ptr<Device> device);
+
+	/* Apps */
+	pplx::task<std::vector<InstalledApp>> FetchInstalledApps(std::shared_ptr<Device> device);
 
 	std::function<void(std::shared_ptr<Device>)> connectedDeviceCallback() const;
 	void setConnectedDeviceCallback(std::function<void(std::shared_ptr<Device>)> callback);

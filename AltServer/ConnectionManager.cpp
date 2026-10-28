@@ -32,6 +32,8 @@
 #include "Error.hpp"
 
 #include <memory>
+#include <thread>
+#include <chrono>
 
 #define WIRED_SERVER_CONNECTION_AVAILABLE_REQUEST "io.altstore.Request.WiredServerConnectionAvailable"
 #define WIRED_SERVER_CONNECTION_AVAILABLE_RESPONSE "io.altstore.Response.WiredServerConnectionAvailable"
@@ -239,7 +241,9 @@ void ConnectionManager::StartNotificationConnection(std::shared_ptr<Device> devi
 				this->HandleNotification(notification, connection);
 			});
 
+			this->_notificationConnectionsLock.lock();
 			this->_notificationConnections[device->identifier()] = connection;
+			this->_notificationConnectionsLock.unlock();
 		}
 		catch (Error& e)
 		{
@@ -254,15 +258,26 @@ void ConnectionManager::StartNotificationConnection(std::shared_ptr<Device> devi
 
 void ConnectionManager::StopNotificationConnection(std::shared_ptr<Device> device)
 {
+	this->_notificationConnectionsLock.lock();
+
 	if (this->notificationConnections().count(device->identifier()) == 0)
 	{
+		this->_notificationConnectionsLock.unlock();
 		return;
 	}
 
 	auto connection = this->notificationConnections()[device->identifier()];
+	if (connection == NULL)
+	{
+		this->_notificationConnectionsLock.unlock();
+		return;
+	}
+
 	connection->Disconnect();
 
 	this->_notificationConnections.erase(device->identifier());
+	
+	this->_notificationConnectionsLock.unlock();
 }
 
 void ConnectionManager::HandleNotification(std::string notification, std::shared_ptr<NotificationConnection> connection)
@@ -322,12 +337,15 @@ void ConnectionManager::HandleRequest(std::shared_ptr<ClientConnection> clientCo
 		}
 		catch (Error& e)
 		{
-			odslog("Failed to handle request:" << e.localizedDescription().c_str());
+			odslog("Failed to handle request: " << e.localizedDescription().c_str());
 		}
 		catch (std::exception& e)
 		{
-			odslog("Failed to handle request:" << e.what());
+			odslog("Failed to handle request: " << e.what());
 		}
+
+        // Add short delay to prevent us from dropping connection too quickly.
+        std::this_thread::sleep_for(std::chrono::seconds(1));
 		
 		this->Disconnect(clientConnection);
 	});

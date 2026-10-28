@@ -21,7 +21,11 @@
 #include "AppleAPISession.h"
 #include "AnisetteDataManager.h"
 
+#include "DeveloperDiskManager.h"
+
 #include "Semaphore.h"
+
+#include "InstalledApp.h"
 
 #include <pplx/pplxtasks.h>
 
@@ -46,12 +50,17 @@ public:
 	void CheckForUpdates();
     
 	pplx::task<std::shared_ptr<Application>> InstallApplication(std::optional<std::string> filepath, std::shared_ptr<Device> device, std::string appleID, std::string password);
+	pplx::task<void> PrepareDevice(std::shared_ptr<Device> device);
+	pplx::task<void> EnableJIT(InstalledApp app, std::shared_ptr<Device> device);
 
 	void ShowNotification(std::string title, std::string message);
 	void ShowAlert(std::string title, std::string message);
+    void ShowErrorAlert(std::exception& exception, std::string localizedTitle);
 
 	HWND windowHandle() const;
 	HINSTANCE instanceHandle() const;
+
+	Error* helpError() const;
 
 	bool automaticallyLaunchAtLogin() const;
 	void setAutomaticallyLaunchAtLogin(bool launch);
@@ -65,6 +74,14 @@ public:
 	std::string appleFolderPath() const;
 	std::string internetServicesFolderPath() const;
 	std::string applicationSupportFolderPath() const;
+
+	fs::path appDataDirectoryPath() const;
+	fs::path certificatesDirectoryPath() const;
+	fs::path developerDisksDirectoryPath() const;
+
+	bool boolValueForRegistryKey(std::string key) const;
+	void setBoolValueForRegistryKey(bool value, std::string key);
+
 private:
 	AltServerApp();
 	~AltServerApp();
@@ -79,11 +96,15 @@ private:
 	std::string BrowseForFolder(std::wstring title, std::string folderPath);
 
 	bool _presentedNotification;
+	GUID _notificationIconGUID;
 
 	HWND _windowHandle;
 	HINSTANCE _instanceHandle;
 
 	Semaphore _appGroupSemaphore;
+	Error* _helpError;
+
+	DeveloperDiskManager _developerDiskManager;
 
 	bool presentedRunningNotification() const;
 	void setPresentedRunningNotification(bool presentedRunningNotification);
@@ -91,12 +112,10 @@ private:
 	void setAppleFolderPath(std::string appleFolderPath);
 	std::string defaultAppleFolderPath() const;
 
-	fs::path appDataDirectoryPath() const;
-	fs::path certificatesDirectoryPath() const;
-
 	void HandleAnisetteError(AnisetteError& error);
     
-    pplx::task<fs::path> DownloadApp();
+    pplx::task<fs::path> DownloadApp(std::shared_ptr<Device> device);
+	pplx::task<std::string> FetchAltStoreDownloadURL(std::shared_ptr<Device> device);
 
 	void ShowInstallationNotification(std::string appName, std::string deviceName);
     

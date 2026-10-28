@@ -21,7 +21,18 @@ extern std::vector<unsigned char> readFile(const char* filename);
 
 namespace fs = std::filesystem;
 
-Application::Application()
+Device::Type DeviceTypeFromUIDeviceFamily(int deviceFamily)
+{
+	switch (deviceFamily)
+	{
+	case 1: return Device::Type::iPhone;
+	case 2: return Device::Type::iPad;
+	case 3: return Device::Type::AppleTV;
+	default: return Device::Type::None;
+	}
+}
+
+Application::Application() : _minimumOSVersion(0, 0, 0)
 {
 }
 
@@ -33,12 +44,14 @@ Application::~Application()
 	}
 }
 
-Application::Application(const Application& app)
+Application::Application(const Application& app) : _minimumOSVersion(0, 0, 0)
 {
 	_name = app.name();
 	_bundleIdentifier = app.bundleIdentifier();
 	_version = app.version();
 	_path = app.path();
+	_minimumOSVersion = app.minimumOSVersion();
+	_supportedDeviceTypes = app.supportedDeviceTypes();
 
 	// Don't assign _entitlementsString or _entitlements,
 	// since each copy will create its own entitlements lazily.
@@ -56,11 +69,13 @@ Application& Application::operator=(const Application& app)
 	_bundleIdentifier = app.bundleIdentifier();
 	_version = app.version();
 	_path = app.path();
+	_minimumOSVersion = app.minimumOSVersion();
+	_supportedDeviceTypes = app.supportedDeviceTypes();
 
 	return *this;
 }
 
-Application::Application(std::string appBundlePath)
+Application::Application(std::string appBundlePath) : _minimumOSVersion(0, 0, 0)
 {
     fs::path path(appBundlePath);
     path.append("Info.plist");
@@ -73,29 +88,93 @@ Application::Application(std::string appBundlePath)
     {
         throw SignError(SignErrorCode::InvalidApp);
     }
-    
-    auto nameNode = plist_dict_get_item(plist, "CFBundleName");
-    auto bundleIdentifierNode = plist_dict_get_item(plist, "CFBundleIdentifier");
-    auto versionNode = plist_dict_get_item(plist, "CFBundleShortVersionString");
 
-    if (nameNode == nullptr || bundleIdentifierNode == nullptr || versionNode == nullptr)
+	// Required properties
+	auto nameNode = plist_dict_get_item(plist, "CFBundleDisplayName");
+	if (nameNode == nullptr)
+	{
+		nameNode = plist_dict_get_item(plist, "CFBundleName");
+	}
+	
+    auto bundleIdentifierNode = plist_dict_get_item(plist, "CFBundleIdentifier");
+
+    if (nameNode == nullptr || bundleIdentifierNode == nullptr)
     {
+		plist_free(plist);
         throw SignError(SignErrorCode::InvalidApp);
     }
-    
-    char *name = nullptr;
-    plist_get_string_val(nameNode, &name);
 
-    char *bundleIdentifier = nullptr;
-    plist_get_string_val(bundleIdentifierNode, &bundleIdentifier);
-    
-    char *version = nullptr;
-    plist_get_string_val(versionNode, &version);
+	char* name = nullptr;
+	plist_get_string_val(nameNode, &name);
+
+	char* bundleIdentifier = nullptr;
+	plist_get_string_val(bundleIdentifierNode, &bundleIdentifier);
+
+	// Optional properties
+	auto versionNode = plist_dict_get_item(plist, "CFBundleShortVersionString");
+	auto minimumOSVersionNode = plist_dict_get_item(plist, "MinimumOSVersion");
+	auto deviceFamilyNode = plist_dict_get_item(plist, "UIDeviceFamily");
+
+	std::string version("1.0");
+	if (versionNode != nullptr)
+	{
+		char* versionString = nullptr;
+		plist_get_string_val(versionNode, &versionString);
+		version = versionString;
+
+		free(versionString);
+	}
+
+	OperatingSystemVersion minimumOSVersion(1, 0, 0);
+	if (minimumOSVersionNode != nullptr)
+	{
+		char* minOSVersionString = nullptr;
+		plist_get_string_val(minimumOSVersionNode, &minOSVersionString);
+		minimumOSVersion = OperatingSystemVersion(minOSVersionString);
+
+		free(minOSVersionString);
+	}
+
+	Device::Type supportedDeviceTypes(Device::Type::iPhone);
+	if (deviceFamilyNode != nullptr)
+	{
+		if (PLIST_IS_UINT(deviceFamilyNode))
+		{
+			uint64_t deviceFamily = 0;
+			plist_get_uint_val(deviceFamilyNode, &deviceFamily);
+
+			supportedDeviceTypes = DeviceTypeFromUIDeviceFamily(deviceFamily);
+		}
+		else if (PLIST_IS_ARRAY(deviceFamilyNode) && plist_array_get_size(deviceFamilyNode) > 0)
+		{
+			int rawDeviceTypes = Device::Type::None;
+
+			for (int i = 0; i < plist_array_get_size(deviceFamilyNode); i++)
+			{
+				auto node = plist_array_get_item(deviceFamilyNode, i);
+				
+				uint64_t deviceFamily = 0;
+				plist_get_uint_val(node, &deviceFamily);
+
+				Device::Type deviceType = DeviceTypeFromUIDeviceFamily(deviceFamily);
+				rawDeviceTypes |= (int)deviceType;
+			}
+
+			supportedDeviceTypes = (Device::Type)rawDeviceTypes;
+		}
+	}
 
     _name = name;
     _bundleIdentifier = bundleIdentifier;
     _version = version;
     _path = appBundlePath;
+	_minimumOSVersion = minimumOSVersion;
+	_supportedDeviceTypes = supportedDeviceTypes;
+
+	free(name);
+	free(bundleIdentifier);
+
+	plist_free(plist);
 }
 
 
@@ -171,6 +250,16 @@ std::vector<std::shared_ptr<Application>> Application::appExtensions() const
 	}
 
 	return appExtensions;
+}
+
+OperatingSystemVersion Application::minimumOSVersion() const
+{
+	return _minimumOSVersion;
+}
+
+Device::Type Application::supportedDeviceTypes() const
+{
+	return _supportedDeviceTypes;
 }
 
 std::string Application::entitlementsString()

@@ -11,8 +11,89 @@
 #include "Error.hpp"
 
 #include <algorithm>
+#include <sstream>
+#include <iostream>
 
-Device::Device()
+std::optional<std::string> ALTOperatingSystemNameForDeviceType(Device::Type deviceType)
+{
+	switch (deviceType)
+	{
+	case Device::Type::iPhone:
+	case Device::Type::iPad:
+		return "iOS";
+
+	case Device::Type::AppleTV:
+		return "tvOS";
+
+	case Device::Type::None:
+	case Device::Type::All:
+	default:
+		return std::nullopt;
+	}
+}
+
+OperatingSystemVersion::OperatingSystemVersion(int major, int minor, int patch) : majorVersion(major), minorVersion(minor), patchVersion(patch)
+{
+}
+
+OperatingSystemVersion::OperatingSystemVersion(std::string string) : majorVersion(0), minorVersion(0), patchVersion(0)
+{
+	std::istringstream stream(string.c_str());
+
+	std::string majorVersion;
+	if (!std::getline(stream, majorVersion, '.'))
+	{
+		return;
+	}
+	this->majorVersion = std::stoi(majorVersion);
+
+	std::string minorVersion;
+	if (!std::getline(stream, minorVersion, '.'))
+	{
+		return;
+	}
+	this->minorVersion = std::stoi(minorVersion);
+
+	std::string patchVersion;
+	if (!std::getline(stream, patchVersion, '.'))
+	{
+		return;
+	}
+	this->patchVersion = std::stoi(patchVersion);
+}
+
+std::string OperatingSystemVersion::stringValue() const
+{
+	std::ostringstream oss;
+	oss << this->majorVersion << "." << this->minorVersion;
+
+	if (this->patchVersion != 0)
+	{
+		oss << "." << this->patchVersion;
+	}
+
+	auto stringValue = oss.str();
+	return stringValue;
+}
+
+
+bool OperatingSystemVersion::operator<(const OperatingSystemVersion& osVersion) const
+{
+	if (this->majorVersion != osVersion.majorVersion)
+	{
+		return this->majorVersion < osVersion.majorVersion;
+	}
+	else if (this->minorVersion != osVersion.minorVersion)
+	{
+		return this->minorVersion < osVersion.minorVersion;
+	}
+	else
+	{
+		return this->patchVersion < osVersion.patchVersion;
+	}
+}
+
+Device::Device() : _osVersion(0, 0, 0)
 {
 }
 
@@ -20,11 +101,11 @@ Device::~Device()
 {
 }
 
-Device::Device(std::string name, std::string identifier, Device::Type type) : _name(name), _identifier(identifier), _type(type)
+Device::Device(std::string name, std::string identifier, Device::Type type) : _name(name), _identifier(identifier), _type(type), _osVersion(0, 0, 0)
 {
 }
 
-Device::Device(plist_t plist)
+Device::Device(plist_t plist) : _osVersion(0, 0, 0)
 {
     auto nameNode = plist_dict_get_item(plist, "name");
     auto identifierNode = plist_dict_get_item(plist, "deviceNumber");
@@ -84,6 +165,11 @@ std::string Device::name() const
     return _name;
 }
 
+void Device::setName(std::string name)
+{
+	_name = name;
+}
+
 std::string Device::identifier() const
 {
     return _identifier;
@@ -92,4 +178,14 @@ std::string Device::identifier() const
 Device::Type Device::type() const
 {
 	return _type;
+}
+
+void Device::setOSVersion(OperatingSystemVersion version)
+{
+	_osVersion = version;
+}
+
+OperatingSystemVersion Device::osVersion() const
+{
+	return _osVersion;
 }

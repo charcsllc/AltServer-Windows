@@ -21,22 +21,17 @@ enum class AnisetteErrorCode
 class AnisetteError : public Error
 {
 public:
-	AnisetteError(AnisetteErrorCode code) : Error((int)code)
+	AnisetteError(AnisetteErrorCode code, std::map<std::string, std::any> userInfo = {}) : Error((int)code, userInfo)
 	{
 	}
 
 	virtual std::string domain() const
 	{
-		return "com.rileytestut.AltServer.AnisetteError";
+		return "AltServer.AppleProgramError";
 	}
 
-	virtual std::string localizedDescription() const
+	virtual std::optional<std::string> localizedFailureReason() const
 	{
-		if (this->_localizedDescription.size() > 0)
-		{
-			return this->_localizedDescription;
-		}
-
 		switch ((AnisetteErrorCode)this->code())
 		{
 		case AnisetteErrorCode::iTunesNotInstalled: return "iTunes Not Found";
@@ -48,16 +43,8 @@ public:
 		case AnisetteErrorCode::InvalidiTunesInstallation: return "Invalid iTunes installation.";
 		}
 
-		return "";
+		return std::nullopt;
 	}
-
-	void setLocalizedDescription(std::string localizedDescription)
-	{
-		_localizedDescription = localizedDescription;
-	}
-
-private:
-	std::string _localizedDescription;
 };
 
 class AnisetteDataManager
