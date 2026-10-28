@@ -30,6 +30,9 @@
     <ClCompile Include="AnisetteDataManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="RemoteAnisetteProvider.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="NotificationConnection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -78,6 +81,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="AnisetteDataManager.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="RemoteAnisetteProvider.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="NotificationConnection.h">

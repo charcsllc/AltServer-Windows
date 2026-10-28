@@ -11,6 +11,7 @@
 
 #include "AnisetteData.h"
 #include "AltServerApp.h"
+#include "RemoteAnisetteProvider.h"
 
 //#define SPOOF_MAC 1
 
@@ -362,6 +363,11 @@ bool AnisetteDataManager::LoadDependencies()
 
 std::shared_ptr<AnisetteData> AnisetteDataManager::FetchAnisetteData()
 {
+	if (RemoteAnisetteProvider::isEnabled())
+	{
+		return RemoteAnisetteProvider::instance()->FetchAnisetteData();
+	}
+
 	if (!this->loadedDependencies)
 	{
 		this->LoadDependencies();
@@ -551,6 +557,12 @@ bool AnisetteDataManager::ReprovisionDevice(std::function<void(void)> provisionC
 
 bool AnisetteDataManager::ResetProvisioning()
 {
+	if (RemoteAnisetteProvider::isEnabled())
+	{
+		RemoteAnisetteProvider::instance()->ResetProvisioning();
+		return true;
+	}
+
 	std::string adiDirectoryPath = "C:\\ProgramData\\Apple Computer\\iTunes\\adi";
 
 	// Remove existing AltServer .pb files so we can create new ones next time we provision this device.

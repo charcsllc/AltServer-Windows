@@ -179,6 +179,7 @@
     <ClCompile Include="DeviceManager.cpp" />
     <ClCompile Include="InstalledApp.cpp" />
     <ClCompile Include="NotificationConnection.cpp" />
+    <ClCompile Include="RemoteAnisetteProvider.cpp" />
     <ClCompile Include="ServerError.cpp" />
     <ClCompile Include="WiredConnection.cpp" />
     <ClCompile Include="WirelessConnection.cpp" />
@@ -196,6 +197,7 @@
     <ClInclude Include="InstalledApp.h" />
     <ClInclude Include="InstallError.hpp" />
     <ClInclude Include="NotificationConnection.h" />
+    <ClInclude Include="RemoteAnisetteProvider.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="Semaphore.h" />
     <ClInclude Include="ServerError.hpp" />
