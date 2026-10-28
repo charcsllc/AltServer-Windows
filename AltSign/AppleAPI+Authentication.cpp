@@ -41,26 +41,6 @@ static const char ALTHexCharacters[] = "0123456789abcdef";
 
 struct ccrng_state* RNG = NULL;
 
-// Apple only issues com.apple.gs.xcode.auth tokens to clients claiming to be a Mac (-80046),
-// but still rejects sign-in requests whose client info doesn't match the anisette data's platform (-80045).
-// So we sign in with the native client info, then claim to be a Mac for the app token and every request made with it.
-static const std::string ALTMacClientInfo = "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
-
-static std::shared_ptr<AnisetteData> ALTMacAnisetteData(std::shared_ptr<AnisetteData> anisetteData)
-{
-	return std::make_shared<AnisetteData>(
-		anisetteData->machineID(),
-		anisetteData->oneTimePassword(),
-		anisetteData->localUserID(),
-		anisetteData->routingInfo(),
-		anisetteData->deviceUniqueIdentifier(),
-		anisetteData->deviceSerialNumber(),
-		ALTMacClientInfo,
-		anisetteData->date(),
-		anisetteData->locale(),
-		anisetteData->timeZone());
-}
-
 std::vector<unsigned char> DataFromBytes(const char* bytes, size_t count)
 {
 	std::vector<unsigned char> data;
@@ -689,12 +669,10 @@ pplx::task<std::pair<std::shared_ptr<Account>, std::shared_ptr<AppleAPISession>>
 						{ "o", plist_new_string("apptokens") }
 					};
 
-					auto macAnisetteData = ALTMacAnisetteData(anisetteData);
-
 					*adsidValue = std::string(adsid);
-					return this->FetchAuthToken(parameters, sk, macAnisetteData)
+					return this->FetchAuthToken(parameters, sk, anisetteData)
 					.then([=](std::string token) {
-						auto session = std::make_shared<AppleAPISession>(*adsidValue, token, macAnisetteData);
+						auto session = std::make_shared<AppleAPISession>(*adsidValue, token, anisetteData);
 						*sessionValue = *session;
 
 						return this->FetchAccount(session);
