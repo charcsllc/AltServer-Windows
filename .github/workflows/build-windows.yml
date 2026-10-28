@@ -8,6 +8,11 @@ on:
 permissions:
   contents: write
 
+# Each run replaces the release, so don't let runs overlap.
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   ALTSERVER_VERSION: 1.8.1
   VCPKG_TRIPLET: x86-windows
@@ -153,9 +158,11 @@ jobs:
           $notes = @"
           Unofficial AltServer for Windows $env:ALTSERVER_VERSION, built from ``$env:GITHUB_REF_NAME`` ($env:GITHUB_SHA).
 
-          Works around Apple error -80046 ("This action cannot be completed at this time") by claiming to be a Mac when requesting the Xcode auth token, while still signing in with the native Windows client info.
+          Works around Apple errors -80046 ("This action cannot be completed at this time") and -22410 by fetching Mac anisette data from an anisette v3 server (mac-ani.jkcoxson.com, new.ani.sidestore.io or ani3.stikstore.app) instead of generating it with iCloud for Windows. AltStore also receives this anisette data when it asks AltServer for it.
 
-          This build is untested. To try it, quit AltServer, back up your AltServer installation folder, then replace its contents with the files in the zip.
+          The anisette server sees your IP address and this PC's provisioning data, but never your Apple ID, password or verification codes. Set the ALTSERVER_ANISETTE_SERVER environment variable to use a different server, or ALTSERVER_ANISETTE=local to use iCloud for Windows again.
+
+          This build is untested. To try it, quit AltServer, back up your AltServer installation folder, then replace its contents with the files in the zip. Don't install AltServer updates if it offers any, since they would replace this build.
           "@
 
           gh release view $tag *> $null
