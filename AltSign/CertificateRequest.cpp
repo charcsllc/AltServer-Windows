@@ -81,7 +81,8 @@ CertificateRequest::CertificateRequest()
     const char *commonName = "AltSign";
     
     request = X509_REQ_new();
-    if (X509_REQ_set_version(request, 1) != 1)
+    // OpenSSL 3 only accepts version 0 (X509_REQ_VERSION_1), which is the only version defined for certificate requests.
+    if (X509_REQ_set_version(request, 0) != 1)
     {
         finish();
         return;
@@ -106,7 +107,7 @@ CertificateRequest::CertificateRequest()
     }
     
     // Sign request
-    if (X509_REQ_sign(request, publicKey, EVP_sha1()) <= 0)
+    if (X509_REQ_sign(request, publicKey, EVP_sha256()) <= 0)
     {
         finish();
         return;
