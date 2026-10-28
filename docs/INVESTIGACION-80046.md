@@ -99,6 +99,12 @@ reg query "HKLM\SOFTWARE\Policies\Microsoft\SystemCertificates\AuthRoot" /v Disa
 
 ## 6. Plan para el error SSL (siguiente paso)
 
+**Actualización (28/10):** en tu PC, `Invoke-WebRequest` conectó sin problema y `DisableRootAutoUpdate` no existe. Por tanto Windows sí confía en los certificados, y el fallo es solo la **comprobación de revocación que fuerza cpprestsdk**. Solución aplicada:
+- Las peticiones a los servidores anisette usan **WinHTTP directamente**, con la validación normal de Windows (autoridad, nombre y fecha) y sin exigir la revocación, igual que PowerShell.
+- Las de registro con `gsa.apple.com` relajan solo la autoridad, como ya hace AltSign.
+
+Si aun así fallara, lo de abajo queda como plan B.
+
 Hacer que AltServer **verifique los certificados por su cuenta, sin depender del almacén de Windows ni de la revocación**, sin desactivar la seguridad:
 
 1. Hacer las peticiones a los servidores anisette y a `gsa.apple.com` (registro del PC) con un pequeño cliente **WinHTTP propio**, no con cpprestsdk.

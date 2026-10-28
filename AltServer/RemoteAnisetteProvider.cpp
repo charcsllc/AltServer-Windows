@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <memory>
 #include <optional>
 #include <sstream>
 
@@ -82,6 +83,110 @@ namespace
 		std::stringstream ss;
 		ss << operation << " failed (WinHTTP error " << error << ").";
 		throw RemoteAnisetteError((int)error, ss.str());
+	}
+
+	struct WinHttpConnection
+	{
+		WinHttpHandle session;
+		WinHttpHandle connection;
+		bool isSecure = false;
+	};
+
+	std::unique_ptr<WinHttpConnection> OpenConnection(const uri& serverURI)
+	{
+		auto connection = std::make_unique<WinHttpConnection>();
+		connection->isSecure = (serverURI.scheme() == U("https"));
+
+		INTERNET_PORT port = (serverURI.port() > 0) ? (INTERNET_PORT)serverURI.port() : (connection->isSecure ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT);
+
+		connection->session.reset(WinHttpOpen(L"AltServer", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+		if (!connection->session)
+		{
+			ThrowWinHttpError("Opening WinHTTP session");
+		}
+
+		WinHttpSetTimeouts(connection->session.get(), 30000, 30000, 30000, 30000);
+
+		connection->connection.reset(WinHttpConnect(connection->session.get(), serverURI.host().c_str(), port, 0));
+		if (!connection->connection)
+		{
+			ThrowWinHttpError("Connecting to " + StringFromWideString(serverURI.host()));
+		}
+
+		return connection;
+	}
+
+	// Uses WinHTTP directly rather than cpprestsdk, because cpprestsdk requires checking certificate revocation,
+	// which fails on some PCs (WINHTTP_CALLBACK_STATUS_FLAG_CERT_REV_FAILED) even though the certificates are trusted.
+	std::string SendHTTPRequest(std::string url, const wchar_t* method, const std::map<utility::string_t, utility::string_t>& headers, const std::string& body, bool validateCertificateAuthority = true)
+	{
+		uri requestURI(WideStringFromString(url));
+		auto connection = OpenConnection(requestURI);
+
+		auto resource = requestURI.resource().to_string();
+
+		WinHttpHandle request(WinHttpOpenRequest(connection->connection.get(), method, resource.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, connection->isSecure ? WINHTTP_FLAG_SECURE : 0));
+		if (!request)
+		{
+			ThrowWinHttpError("Creating request to " + url);
+		}
+
+		if (!validateCertificateAuthority)
+		{
+			DWORD securityFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA;
+			WinHttpSetOption(request.get(), WINHTTP_OPTION_SECURITY_FLAGS, &securityFlags, sizeof(securityFlags));
+		}
+
+		std::wstring headerLines;
+		for (auto& pair : headers)
+		{
+			headerLines += pair.first + L": " + pair.second + L"\r\n";
+		}
+
+		if (!WinHttpSendRequest(request.get(), headerLines.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headerLines.c_str(), headerLines.empty() ? 0 : (DWORD)-1L,
+								body.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)body.data(), (DWORD)body.size(), (DWORD)body.size(), 0)
+			|| !WinHttpReceiveResponse(request.get(), NULL))
+		{
+			ThrowWinHttpError("Sending request to " + url);
+		}
+
+		DWORD statusCode = 0;
+		DWORD statusCodeSize = sizeof(statusCode);
+		WinHttpQueryHeaders(request.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX);
+
+		std::string responseBody;
+		while (true)
+		{
+			DWORD availableBytes = 0;
+			if (!WinHttpQueryDataAvailable(request.get(), &availableBytes))
+			{
+				ThrowWinHttpError("Reading response from " + url);
+			}
+
+			if (availableBytes == 0)
+			{
+				break;
+			}
+
+			std::vector<char> buffer(availableBytes);
+
+			DWORD bytesRead = 0;
+			if (!WinHttpReadData(request.get(), buffer.data(), availableBytes, &bytesRead))
+			{
+				ThrowWinHttpError("Reading response from " + url);
+			}
+
+			responseBody.append(buffer.data(), bytesRead);
+		}
+
+		if (statusCode < 200 || statusCode >= 300)
+		{
+			std::stringstream ss;
+			ss << url << " returned HTTP " << statusCode << ".";
+			throw RemoteAnisetteError((int)statusCode, ss.str());
+		}
+
+		return responseBody;
 	}
 
 	json::value ReceiveWebSocketMessage(HINTERNET webSocket)
@@ -201,26 +306,14 @@ namespace
 		free(plistXML);
 		plist_free(plist);
 
-		http_request request(methods::POST);
-		request.set_request_uri(path);
-		request.set_body(body, "text/x-xml-plist");
+		auto requestHeaders = headers;
+		requestHeaders[U("Content-Type")] = U("text/x-xml-plist");
 
-		for (auto& pair : headers)
-		{
-			if (request.headers().has(pair.first))
-			{
-				request.headers().remove(pair.first);
-			}
-
-			request.headers().add(pair.first, pair.second);
-		}
-
-		http_client client(U("https://gsa.apple.com"));
-		auto response = client.request(request).get();
-		auto data = response.extract_vector().get();
+		// Like AltSign's GSA requests, don't require Windows to trust Apple's certificate authority.
+		auto data = SendHTTPRequest("https://gsa.apple.com" + StringFromWideString(path), L"POST", requestHeaders, body, false);
 
 		plist_t responsePlist = nullptr;
-		plist_from_xml((const char*)data.data(), (uint32_t)data.size(), &responsePlist);
+		plist_from_xml(data.data(), (uint32_t)data.size(), &responsePlist);
 
 		auto responseDictionary = (responsePlist != nullptr) ? plist_dict_get_item(responsePlist, "Response") : nullptr;
 		if (responseDictionary == nullptr)
@@ -230,9 +323,7 @@ namespace
 				plist_free(responsePlist);
 			}
 
-			std::stringstream ss;
-			ss << "Apple returned an invalid machine provisioning response (HTTP " << response.status_code() << ").";
-			throw RemoteAnisetteError((int)response.status_code(), ss.str());
+			throw RemoteAnisetteError(0, "Apple returned an invalid machine provisioning response.");
 		}
 
 		responseDictionary = plist_copy(responseDictionary);
@@ -321,9 +412,8 @@ std::shared_ptr<AnisetteData> RemoteAnisetteProvider::FetchAnisetteData()
 
 std::shared_ptr<AnisetteData> RemoteAnisetteProvider::FetchAnisetteData(const std::string& serverURL)
 {
-	http_client client(WideStringFromString(serverURL));
-
-	auto clientInfoResponse = client.request(methods::GET, U("/v3/client_info")).get().extract_json(true).get();
+	auto clientInfoData = SendHTTPRequest(serverURL + "/v3/client_info", L"GET", {}, "");
+	auto clientInfoResponse = json::value::parse(WideStringFromString(clientInfoData));
 	auto clientInfo = StringFromWideString(clientInfoResponse.at(U("client_info")).as_string());
 	auto userAgent = StringFromWideString(clientInfoResponse.at(U("user_agent")).as_string());
 
@@ -352,7 +442,8 @@ std::shared_ptr<AnisetteData> RemoteAnisetteProvider::FetchAnisetteData(const st
 		body[U("identifier")] = json::value::string(identifier);
 		body[U("adi_pb")] = json::value::string(WideStringFromString(adiPB));
 
-		auto headers = client.request(methods::POST, U("/v3/get_headers"), body).get().extract_json(true).get();
+		auto headersData = SendHTTPRequest(serverURL + "/v3/get_headers", L"POST", { { U("Content-Type"), U("application/json") } }, StringFromWideString(body.serialize()));
+		auto headers = json::value::parse(WideStringFromString(headersData));
 
 		if (headers.has_field(U("result")) && headers.at(U("result")).as_string() == U("Headers"))
 		{
@@ -392,9 +483,7 @@ std::shared_ptr<AnisetteData> RemoteAnisetteProvider::FetchAnisetteData(const st
 std::string RemoteAnisetteProvider::Provision(const std::string& serverURL, const std::string& clientInfo, const std::string& userAgent)
 {
 	uri serverURI(WideStringFromString(serverURL));
-
-	bool isSecure = (serverURI.scheme() == U("https"));
-	INTERNET_PORT port = (serverURI.port() > 0) ? (INTERNET_PORT)serverURI.port() : (isSecure ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT);
+	auto connection = OpenConnection(serverURI);
 
 	auto path = serverURI.path();
 	if (!path.empty() && path.back() == U('/'))
@@ -403,21 +492,7 @@ std::string RemoteAnisetteProvider::Provision(const std::string& serverURL, cons
 	}
 	path += U("/v3/provisioning_session");
 
-	WinHttpHandle session(WinHttpOpen(L"AltServer", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
-	if (!session)
-	{
-		ThrowWinHttpError("Opening WinHTTP session");
-	}
-
-	WinHttpSetTimeouts(session.get(), 30000, 30000, 30000, 30000);
-
-	WinHttpHandle connection(WinHttpConnect(session.get(), serverURI.host().c_str(), port, 0));
-	if (!connection)
-	{
-		ThrowWinHttpError("Connecting to anisette server");
-	}
-
-	WinHttpHandle request(WinHttpOpenRequest(connection.get(), L"GET", path.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, isSecure ? WINHTTP_FLAG_SECURE : 0));
+	WinHttpHandle request(WinHttpOpenRequest(connection->connection.get(), L"GET", path.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, connection->isSecure ? WINHTTP_FLAG_SECURE : 0));
 	if (!request)
 	{
 		ThrowWinHttpError("Creating provisioning session request");
