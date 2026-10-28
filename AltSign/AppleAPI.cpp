@@ -61,47 +61,42 @@ extern std::wstring WideStringFromString(std::string string);
 
 bool decompress(const uint8_t* input, size_t input_size, std::vector<uint8_t>& output)
 {
-    auto decompressor = web::http::compression::builtin::make_decompressor(web::http::compression::builtin::algorithm::GZIP);
-    
     // Need to guard against attempting to decompress when we're already finished or encountered an error!
     if (input == nullptr || input_size == 0)
     {
         return false;
     }
-    
-    size_t processed;
-    size_t got;
-    size_t inbytes = 0;
-    size_t outbytes = 0;
-    bool done;
-    
-    try
-    {
-        output.resize(input_size * 3);
-        do
-        {
-            if (inbytes)
-            {
-                output.resize(output.size() + (std::max)(input_size, static_cast<size_t>(1024)));
-            }
-            got = decompressor->decompress(input + inbytes,
-                                             input_size - inbytes,
-                                             output.data() + outbytes,
-                                             output.size() - outbytes,
-                                           web::http::compression::operation_hint::is_last,
-                                             processed,
-                                             done);
-            inbytes += processed;
-            outbytes += got;
-        } while (got && !done);
-        output.resize(outbytes);
-    }
-    catch (...)
+
+    // Use zlib directly, since cpprestsdk's builtin GZIP decompressor is null when cpprestsdk is built without compression support.
+    z_stream stream = {};
+    if (inflateInit2(&stream, 15 + 32) != Z_OK) // 15 + 32 = detect gzip or zlib header automatically.
     {
         return false;
     }
-    
-    return true;
+
+    stream.next_in = (Bytef*)input;
+    stream.avail_in = (uInt)input_size;
+
+    output.resize(input_size * 3);
+
+    int result = Z_OK;
+    while (result == Z_OK)
+    {
+        if (stream.total_out >= output.size())
+        {
+            output.resize(output.size() + (std::max)(input_size, static_cast<size_t>(1024)));
+        }
+
+        stream.next_out = output.data() + stream.total_out;
+        stream.avail_out = (uInt)(output.size() - stream.total_out);
+
+        result = inflate(&stream, Z_NO_FLUSH);
+    }
+
+    output.resize(stream.total_out);
+    inflateEnd(&stream);
+
+    return (result == Z_STREAM_END);
 }
 
 AppleAPI* AppleAPI::instance_ = nullptr;
